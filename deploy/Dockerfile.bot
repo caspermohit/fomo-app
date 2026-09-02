@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DASHBOARD_HOST=0.0.0.0 \
+    DASHBOARD_PORT=5055 \
+    DESK_COOKIE_SECURE=true
+
+COPY deploy/requirements-cloud.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bot ./bot
+COPY run.py .
+
+EXPOSE 5055
+CMD ["python", "run.py"]

@@ -1,0 +1,41 @@
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.bot
+    env_file:
+      - ../.env
+    environment:
+      DASHBOARD_HOST: "0.0.0.0"
+      DESK_COOKIE_SECURE: "true"
+      FILL_VENUE: "${FILL_VENUE:-paper}"
+      UI_ORIGIN: "${UI_ORIGIN}"
+    volumes:
+      - ../data:/app/data
+    restart: unless-stopped
+    expose:
+      - "5055"
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        BOT_API_ORIGIN: http://bot:5055
+    environment:
+      BOT_API_ORIGIN: http://bot:5055
+      UI_ORIGIN: "${UI_ORIGIN}"
+    depends_on:
+      - bot
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    depends_on:
+      - web
+    restart: unless-stopped

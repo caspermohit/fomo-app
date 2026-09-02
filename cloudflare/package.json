@@ -1,0 +1,12 @@
+{
+  "name": "fomo-desk-pin",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "wrangler": "^4.34.0"
+  }
+}
