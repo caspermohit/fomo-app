@@ -103,11 +103,13 @@ def create_app(engine: BotEngine) -> Flask:
 
     @app.post("/api/buy")
     def buy():
-        return jsonify(engine.manual_buy())
+        data = request.get_json(silent=True) or {}
+        return jsonify(engine.manual_buy(data.get("symbol")))
 
     @app.post("/api/sell")
     def sell():
-        return jsonify(engine.manual_sell())
+        data = request.get_json(silent=True) or {}
+        return jsonify(engine.manual_sell(data.get("symbol")))
 
     @app.post("/api/close")
     def close():
@@ -121,6 +123,8 @@ def create_app(engine: BotEngine) -> Flask:
     @app.post("/api/settings")
     def settings():
         data = request.get_json(silent=True) or {}
+        if "focus" in data:
+            return jsonify(engine.set_focus(str(data["focus"])))
         if "fill_venue" in data:
             return jsonify(engine.set_fill_venue(str(data["fill_venue"])))
         if "max_positions" in data:

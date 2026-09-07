@@ -31,6 +31,7 @@ class Position:
     price: float
     profit: float
     ticket: str = ""
+    magic: int | None = None
 
 
 @dataclass
@@ -59,6 +60,8 @@ class ClosedTrade:
     profit: float
     ticket: str = ""
     utc_day: str = ""
+    magic: int | None = None
+    comment: str = ""
 
 
 class Broker(Protocol):

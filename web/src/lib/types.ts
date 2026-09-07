@@ -9,6 +9,8 @@ export type ClosedTrade = {
   price?: number;
   profit?: number;
   ticket?: string;
+  magic?: number | null;
+  comment?: string;
 };
 
 export type Position = {
@@ -34,6 +36,29 @@ export type Analysis = {
   atr_pips?: number;
   reasons?: string[];
   checks?: Record<string, string>;
+};
+
+export type SymbolBook = {
+  h1?: string | null;
+  h4?: string | null;
+  htf?: string | null;
+  analysis?: Analysis;
+  bid?: number | null;
+  ask?: number | null;
+  spread?: number | null;
+  last_price?: number | null;
+  last_reason?: string;
+  last_signal?: string;
+  bars?: Bar[];
+  open_count?: number;
+  blockers?: string[];
+  max_spread_pips?: number;
+  min_atr_pips?: number;
+  pip_value?: number;
+  macd_fills?: number;
+  macd_wins?: number;
+  macd_win_rate?: number | null;
+  macd_net?: number | null;
 };
 
 export type BotState = {
@@ -66,12 +91,29 @@ export type BotState = {
   fills?: number;
   wins?: number;
   win_rate?: number;
+  macd_fills?: number;
+  macd_wins?: number;
+  /** null when no MACD-era closes yet — UI shows n/a, not 0%. */
+  macd_win_rate?: number | null;
+  macd_net?: number | null;
+  macd_by_symbol?: Record<
+    string,
+    {
+      macd_fills?: number;
+      macd_wins?: number;
+      macd_win_rate?: number | null;
+      macd_net?: number | null;
+    }
+  >;
   net_edge?: number;
   spread?: number | null;
   hedge_pct?: number;
   hedge_dir?: string;
   open_count?: number;
   max_positions?: number;
+  max_positions_total?: number;
+  profit_arm_usd?: number;
+  profit_giveback_pct?: number;
   bankroll?: number;
   next_lot?: number;
   risk_pct?: number;
@@ -80,6 +122,8 @@ export type BotState = {
   min_atr_pips?: number;
   session_start_hour?: number;
   session_end_hour?: number;
+  session_start_minute?: number;
+  session_end_minute?: number;
   min_score?: number;
   take_atr_mult?: number;
   stop_atr_mult?: number;
@@ -88,7 +132,14 @@ export type BotState = {
   htf?: string | null;
   h1?: string | null;
   h4?: string | null;
+  symbols?: string[];
+  focus?: string;
+  books?: Record<string, SymbolBook>;
   max_spread_pips?: number;
+  max_spread_pips_jpy?: number;
+  max_spread_pips_xau?: number;
+  min_atr_pips_xau?: number;
+  pip_value?: number;
   mutex?: {
     required?: boolean;
     magic?: number;
@@ -156,6 +207,9 @@ export type ApiResult = {
   message?: string;
   ticket?: string;
   max_positions?: number;
+  max_positions_total?: number;
+  profit_arm_usd?: number;
+  profit_giveback_pct?: number;
   fill_venue?: string;
 };
 

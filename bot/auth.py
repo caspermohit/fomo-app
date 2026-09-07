@@ -85,6 +85,9 @@ def clear_fails(ip: str) -> None:
 
 
 def cookie_secure(request: Request) -> bool:
+    host = (request.host or "").split(":")[0].lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return False
     flag = os.getenv("DESK_COOKIE_SECURE", "").strip().lower()
     if flag in {"1", "true", "yes"}:
         return True

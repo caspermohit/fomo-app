@@ -1,3 +1,4 @@
+import type { BalancePoint } from "@/lib/format";
 import type { Bar, ClosedTrade, Position } from "@/lib/types";
 
 function size(canvas: HTMLCanvasElement): [number, number, CanvasRenderingContext2D] | null {
@@ -30,6 +31,143 @@ export function drawSpark(canvas: HTMLCanvasElement, data: number[], color: stri
     else ctx.moveTo(px, py);
   });
   ctx.stroke();
+}
+
+function fmtAxisCash(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1000) {
+    return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  }
+  return "$" + n.toFixed(2);
+}
+
+/** Bill Excel money graph: trade number on X, running demo balance on Y. */
+export function drawMoneyGraph(canvas: HTMLCanvasElement, points: BalancePoint[], start: number) {
+  const sized = size(canvas);
+  if (!sized) return;
+  const [w, h, ctx] = sized;
+  ctx.clearRect(0, 0, w, h);
+
+  const padL = 96;
+  const padR = 124;
+  const padT = 22;
+  const padB = 36;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  if (points.length < 2) {
+    ctx.fillStyle = "#6f6d67";
+    ctx.font = "22px IBM Plex Mono";
+    ctx.fillText("no closed trades yet — curve starts at deposit", padL, h / 2);
+    ctx.strokeStyle = "#eceae4";
+    ctx.beginPath();
+    ctx.moveTo(padL, padT + plotH / 2);
+    ctx.lineTo(w - padR, padT + plotH / 2);
+    ctx.stroke();
+    return;
+  }
+
+  const vals = points.map((p) => p.balance);
+  vals.push(start);
+  const rawMin = Math.min(...vals);
+  const rawMax = Math.max(...vals);
+  const pad = Math.max((rawMax - rawMin) * 0.12, 8);
+  const min = rawMin - pad;
+  const max = rawMax + pad;
+  const span = max - min || 1;
+  const maxN = Math.max(...points.map((p) => p.n), 1);
+  const xAt = (n: number) => padL + (n / maxN) * plotW;
+  const yAt = (v: number) => padT + ((max - v) / span) * plotH;
+  const last = points[points.length - 1];
+  const up = last.balance >= start - 0.004;
+  const line = up ? "#16a34a" : "#e11d48";
+  const startY = yAt(start);
+
+  ctx.strokeStyle = "#eceae4";
+  ctx.lineWidth = 1;
+  const ticks = [max, start, min];
+  const seenY = new Set<number>();
+  for (const tick of ticks) {
+    const gy = Math.round(yAt(tick));
+    if (seenY.has(gy)) continue;
+    seenY.add(gy);
+    ctx.beginPath();
+    ctx.moveTo(padL, gy);
+    ctx.lineTo(w - padR, gy);
+    ctx.stroke();
+    ctx.fillStyle = "#6f6d67";
+    ctx.font = "20px IBM Plex Mono";
+    ctx.fillText(fmtAxisCash(tick), 10, gy + 6);
+  }
+
+  ctx.setLineDash([6, 5]);
+  ctx.strokeStyle = "#a8a29e";
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(padL, startY);
+  ctx.lineTo(w - padR, startY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const realized = points.filter((p) => !p.live);
+  const live = points.find((p) => p.live);
+  const lastReal = realized[realized.length - 1];
+
+  ctx.strokeStyle = line;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  realized.forEach((p, i) => {
+    if (i === 0) ctx.moveTo(xAt(p.n), yAt(p.balance));
+    else ctx.lineTo(xAt(p.n), yAt(p.balance));
+  });
+  ctx.stroke();
+
+  if (live && lastReal) {
+    ctx.setLineDash([7, 5]);
+    ctx.strokeStyle = line;
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(xAt(lastReal.n), yAt(lastReal.balance));
+    ctx.lineTo(xAt(live.n), yAt(live.balance));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = line;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(xAt(live.n), yAt(live.balance), 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  if (realized.length <= 90) {
+    ctx.fillStyle = line;
+    realized.forEach((p, i) => {
+      if (i === 0) return;
+      ctx.beginPath();
+      ctx.arc(xAt(p.n), yAt(p.balance), 3.4, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  let lastLabelY = yAt(last.balance) + 5;
+  let startLabelY = startY + 5;
+  if (Math.abs(lastLabelY - startLabelY) < 18) {
+    lastLabelY = startLabelY + 20;
+  }
+  ctx.fillStyle = "#a8a29e";
+  ctx.font = "18px IBM Plex Mono";
+  ctx.fillText("start " + fmtAxisCash(start), w - padR + 8, startLabelY);
+  ctx.fillStyle = line;
+  ctx.font = "20px IBM Plex Mono";
+  ctx.fillText(fmtAxisCash(last.balance), w - padR + 8, lastLabelY);
+
+  ctx.fillStyle = "#6f6d67";
+  ctx.font = "18px IBM Plex Mono";
+  const trades = Math.max(realized.length - 1, 0);
+  ctx.fillText("0", padL, h - 12);
+  if (trades > 1) ctx.fillText(String(Math.round(trades / 2)), xAt(trades / 2) - 8, h - 12);
+  ctx.fillText(live ? `${trades} + live` : `${trades} trades`, w - padR - 88, h - 12);
 }
 
 function liveBars(bars: Bar[], last?: number | null, bid?: number | null, ask?: number | null): Bar[] {

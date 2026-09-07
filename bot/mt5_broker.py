@@ -146,7 +146,8 @@ class MT5Broker:
                     backend._fomo_owner = self
             except Exception:
                 pass
-            mt5.symbol_select(self.settings.symbol, True)
+            for pair in self.settings.pairs:
+                mt5.symbol_select(pair, True)
             return self.refresh_account()
         except Exception:
             try:
@@ -182,13 +183,19 @@ class MT5Broker:
             if getattr(deal, "entry", 0) not in (1, 2):
                 continue
             symbol = getattr(deal, "symbol", self.settings.symbol)
-            if symbol and symbol != self.settings.symbol:
+            allowed = set(self.settings.pairs)
+            if symbol and symbol not in allowed:
                 continue
             profit = float(getattr(deal, "profit", 0) or 0)
             swap = float(getattr(deal, "swap", 0) or 0)
             commission = float(getattr(deal, "commission", 0) or 0)
             side = "SELL" if getattr(deal, "type", 0) == 1 else "BUY"
             when = datetime.fromtimestamp(int(deal.time), timezone.utc)
+            magic_raw = getattr(deal, "magic", None)
+            try:
+                magic = int(magic_raw) if magic_raw is not None else None
+            except (TypeError, ValueError):
+                magic = None
             out.append(
                 ClosedTrade(
                     time=when.strftime("%Y-%m-%d %H:%M:%S"),
@@ -199,6 +206,8 @@ class MT5Broker:
                     price=float(getattr(deal, "price", 0) or 0),
                     profit=round(profit + swap + commission, 2),
                     ticket=str(getattr(deal, "ticket", "")),
+                    magic=magic,
+                    comment=str(getattr(deal, "comment", "") or ""),
                 )
             )
         return list(reversed(out[-2000:]))
@@ -242,6 +251,46 @@ class MT5Broker:
                     return hourly.tail(count).reset_index(drop=True)
         raise RuntimeError(f"No MT5 bars for {symbol} {timeframe}")
 
+    def symbol_specs(self, symbol: str) -> dict:
+        """Live contract spec from the terminal, used for real pip value.
+
+        MetaQuotes-Demo over the Wine bridge often returns None for tick value /
+        contract size, so every field here is optional — bot.risk falls back to
+        the per-class convention when the terminal will not say.
+        """
+        try:
+            self.mt5.symbol_select(symbol, True)
+        except Exception:
+            pass
+        try:
+            info = self.mt5.symbol_info(symbol)
+        except Exception:
+            info = None
+        if info is None:
+            return {}
+
+        def pick(*names):
+            for name in names:
+                raw = info.get(name) if isinstance(info, dict) else getattr(info, name, None)
+                try:
+                    num = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if num > 0:
+                    return num
+            return None
+
+        return {
+            "symbol": symbol,
+            "tick_value": pick("trade_tick_value", "tick_value", "trade_tick_value_profit"),
+            "tick_size": pick("trade_tick_size", "tick_size", "point"),
+            "contract_size": pick("trade_contract_size", "contract_size"),
+            "point": pick("point"),
+            "digits": pick("digits"),
+            "volume_min": pick("volume_min"),
+            "volume_step": pick("volume_step"),
+        }
+
     def tick(self, symbol: str) -> tuple[float, float]:
         tick = self.mt5.symbol_info_tick(symbol)
         if tick is None:
@@ -261,6 +310,7 @@ class MT5Broker:
                     price=float(pos.price_open),
                     profit=float(pos.profit),
                     ticket=str(pos.ticket),
+                    magic=int(getattr(pos, "magic", 0) or 0),
                 )
             )
         return out

@@ -8,7 +8,7 @@ The root `README.md` is stale (it still describes a $50 dummy bankroll). This fi
 
 ## What this project is
 
-A local **MetaQuotes-Demo** desk for EURUSD M5. **Python is the only bot.**
+A local **MetaQuotes-Demo** desk for EURUSD + GBPJPY + **XAUUSD (spot gold)** on M5. **Python is the only bot.**
 
 1. **Python bot** logs into Wine MT5, reads quotes, places tickets, exposes a Flask API.
 2. **Next.js dashboard** at `http://127.0.0.1:3000` polls that API and can start/stop/buy/sell/close.
@@ -85,22 +85,22 @@ Magic number everywhere: **26082601**.
 
 ## Shared analyst (open rules)
 
-Python (`bot/analyst.py`) and the chart indicator follow Trading Rush [Bill the Bot](https://www.youtube.com/watch?v=BIGVu71IT1w) ([writeup](https://tradingrush.net/i-built-a-trading-bot-and-it-actually-made-1000-in-2hrs/)): **money management + multi-timeframe trend**, not a 4/8 score gate and not a candle-color trigger. The video is a demo/YouTube experiment (news blew ~$1000 mid-run). This desk does **not** promise $1000 in 2 hours. Still EURUSD only. Still 0.10 lot cap.
+Python (`bot/analyst.py`) follows the [Trading Rush MACD 100-trade test](https://tradingrush.net/i-risked-macd-trading-strategy-100-times-heres-what-happened/). Not a proven live edge. Still 0.10 lot cap.
 
 | Check | Rule |
 |---|---|
-| Trend | H1 **and** H4 close vs EMA21 must agree. If H4 history is missing, H1 alone is used until H4 fills. |
-| Entry | Clock: one market ticket every **60s** at last price. No M5 candle signal. |
-| Spread | Block if spread **> 2.0 pips** (his London/NY reason). |
-| ATR | Open blocked if ATR **< 1 pip**. |
-| Session | **London + New York** (`07–21 UTC` wall clock). |
-| Size | **≤1%** of demo equity vs SL pips, capped by `MAX_LOT` **0.10**. |
-| Scale-in | Up to **8** same-side tickets. Averaging is allowed. |
-| Exits | **1:1** — TP **1.5×ATR** and SL **1.5×ATR** (his “good distance”, ~50% WR math). |
+| Trend | Close vs **EMA200**. Long only if close > EMA200. Short only if close < EMA200. |
+| HTF | H1/H4 EMA21 is **display only**. The 100-trade article does not use it as an entry gate. |
+| Entry | Default **MACD 12/26/9**. BUY: MACD crosses **above** signal **below zero**. SELL: MACD crosses **below** signal **above zero**. Entry on the **cross-bar close**. |
+| Stop | Beyond the pullback (last-5 M5 swing and/or EMA200, plus 1 pip). |
+| Take | **1.5R** (the backtest clip on that page). |
+| Spread | Block if spread above the per-symbol cap (broker hygiene). |
+| Session | **07:00–20:20 UTC**. Weekend guard on. |
+| Size | **1%** of demo equity vs SL pips, capped by `MAX_LOT` **0.10**. |
+| Scale-in | **Max 1** ticket per symbol, **max 2 open tickets total**. |
+| Fills | Buys at **ask**, sells at **bid**. |
 
-While a Python position is open, the analyst closes on **1:1 ATR multiples**: take-profit **1.5×ATR**, stop-loss **1.5×ATR**. On quiet EURUSD M5 (~1.5 pip ATR) that is about **2.25 / 2.25 pips** (~$2.25 / $2.25 on 0.10 lot). Broker SL/TP on new tickets use those pips.
-
-Exits live only in Python: **1.5×ATR TP / 1.5×ATR SL**. Not percent of EURUSD. The 4/8 M5 score is still computed for the log but is **not** the open gate.
+While a Python position is open, the analyst closes on the frozen pullback SL / 1.5R TP from entry. A bot-managed ticket arms at $3.00 peak floating profit, then closes immediately on a 35% peak-profit giveback; this is in addition to broker SL/TP. Broker SL/TP remain on every ticket.
 
 ---
 
@@ -111,7 +111,7 @@ Exits live only in Python: **1.5×ATR TP / 1.5×ATR SL**. Not percent of EURUSD.
 - Bankroll: **MT5 demo equity** (often ~$100k). `$50` dummy is gone.
 - Size: `1%` of equity vs analyst SL pips, capped by `MAX_LOT` (default **0.10**). On ~$99,999 equity that is **0.10 lots** (~$1/pip). Not 10 lots.
 - Session loss stop: **20% of demo equity**.
-- Max concurrent tickets: `MAX_POSITIONS` default **8**. No mixed BUY+SELL. Bill may average into losers. Pace 60s between new tickets.
+- Max concurrent tickets: `MAX_POSITIONS` default **1**, UI/env clamp **1**. No mixed BUY+SELL. Engine passes `require_pyramid_winners=True`. Entry only on a fresh MACD cross bar. Skip the second pair if the first is already open.
 - Mutex: `EXECUTION_MUTEX_REQUIRED=true`. Python heartbeats `FOMO_PYTHON_ENGINE_ACTIVE`. Python never yields. A leftover trading EA on the chart is a health warning, not a second bot.
 - Feed vs broker: `self.feed` is quotes; `self.broker` is fills. If MT5 attach fails, engine can fall back to paper fills.
 
@@ -152,7 +152,7 @@ Optional extra lock: Cloudflare Access on the hostname, policy **only your email
 
 Next.js app in `web/`. Proxies `/api/*` to Flask `:5055`. Polls `/api/state` every 1s and `/api/health` every 5s.
 
-Shows: METATRADER ON/OFF, RETRY MT5, START/STOP, BUY/SELL at next lot, close per ticket, close all, paper vs MT5 fills, max positions, analyst score/RSI/ATR, equity, blockers, closed history.
+Shows: METATRADER ON/OFF, RETRY MT5, START/STOP, BUY/SELL at next lot, close per ticket, close all, paper vs MT5 fills, max 2 total tickets, peak-giveback profit exit (arm $3, giveback 35%), analyst score/RSI/ATR, equity, blockers, closed history.
 
 Header wraps so UTC / START-STOP do not clip. Client swallows Urban VPN `chrome-extension://` noise (`instrumentation-client.ts`).
 
@@ -182,36 +182,67 @@ Compile note: `scripts/install_mt5_indicator.sh` compiles via `Z:` path and **mu
 TRADE_MODE=demo
 MT5_SERVER=MetaQuotes-Demo
 SYMBOL=EURUSD
+SYMBOLS=EURUSD,GBPJPY,XAUUSD
 RISK_PCT=0.01
 MAX_LOT=0.10
 SL_PIPS=20
 TP_PIPS=40
 POLL_SECONDS=1
-MAX_POSITIONS=8
+MAX_POSITIONS=2
+PROFIT_ARM_USD=3.0
+PROFIT_GIVEBACK_PCT=0.35
 FILL_VENUE=mt5
 HARD_BLOCK_LIVE=true
 EXECUTION_MUTEX_REQUIRED=true
 SESSION_START_HOUR=7
-SESSION_END_HOUR=21
-MIN_ATR_PIPS=1
+SESSION_END_HOUR=20 SESSION_END_MINUTE=20
+MIN_ATR_PIPS=4.0
+MIN_ATR_PIPS_JPY=8.0
+MIN_ATR_PIPS_XAU=500.0
 MIN_SCORE=4
 TAKE_ATR_MULT=1.5
 STOP_ATR_MULT=1.5
 STOP_COOLDOWN_MINUTES=5
-MIN_ENTRY_SECONDS=60
+MIN_ENTRY_SECONDS=300
 MAX_SPREAD_PIPS=2.0
+MAX_SPREAD_PIPS_JPY=4.0
+MAX_SPREAD_PIPS_XAU=80.0
 DESK_PIN=
 ```
 
-SL/TP env pip values are unused for new tickets. Broker stops are **1.5×ATR / 1.5×ATR** in pips.
+SL/TP env pip values are unused for new tickets. Broker stops come from the analyst pullback distance; take is **1.5R**.
+
+---
+
+## Gold (XAUUSD) — third symbol, same rules
+
+Added 3 Sep 2026. **Same strategy, no rule changes**: MACD 12/26/9 fresh cross, M5 EMA200 agreement,
+H1+H4 bias agreement, RSI(14) exhaustion filter, pullback SL, 1.5R TP, 07:00-20:20 UTC session,
+1% risk sizing, magic 26082601, max 1 ticket per symbol and max 2 tickets total, peak-giveback exit
+(arm $3.00, give back 35%).
+
+Verified on this demo account (read-only probe, no orders): `mt5.symbol_info("XAUUSD")` resolves to
+`Metals\XAUUSD` "Gold vs US Dollar", `digits=2`, `point=0.01`, `volume_min/step=0.01`, `volume_max=100`,
+profit currency USD, `trade_mode=4` (full). `symbol_select("XAUUSD", True)` succeeds and quotes stream.
+**Do not use the ticker `GOLD` on this server — that is `Nasdaq\Stock\GOLD`, the Barrick Gold *share*,
+step 1.0.** Other aliases (`XAUUSD.`, `XAUUSDm`, `XAUUSD.m`, `GOLDUSD`, ...) do not exist here.
+
+What is gold-specific:
+
+| Item | Value | Why |
+|---|---|---|
+| Pip | **$0.01** (`point`, digits 2) | not the 0.0001 FX pip |
+| Pip value | **$1.00 per pip per 1.00 lot** (100 oz x $0.01) | broker `tick_value`/`contract_size` first; this Wine bridge returns them as `None`, so the 100 oz convention is the fallback. Never $10/pip, never 1000/USDJPY |
+| `MIN_ATR_PIPS_XAU` | **500** pips = $5.00 M5 ATR | 3000 M5 bars (19 Aug - 3 Sep 2026), 07:00-20:20 UTC: min 247, p25 420, median 551, p75 753, p95 1046 pips. 500 ~ 0.9x session median: dead tape blocked, spread stays ~9% of ATR like the FX pairs |
+| `MAX_SPREAD_PIPS_XAU` | **80** pips = $0.80 | live demo spread sampled 36-49 pips ($0.36-$0.49) in NY hours; ~1.8x that leaves room for normal widening but blocks rollover/news blowouts |
+| Lot | still `MAX_LOT` **0.10** | 1% of ~$99.6k = ~$996 risk / (SL pips x $1) is well above 0.10 on any realistic gold stop, so the 0.10 cap binds (e.g. 700-pip SL -> 0.10 lot = ~$70 risk, 0.07% of equity) |
 
 ---
 
 ## What is actually true in the market
 
-- FX London/NY hours only (`7–21 UTC`). Auto-open needs **H1 and H4 aligned**, **spread ≤ 2 pips**, and **ATR ≥ 1**. No candle-color trigger.
-- Typical quiet EURUSD ATR on M5 is **~1.2 pips** → ATR gate can pass; H1/H4 can still disagree.
-- Fast scalp size is **0.10 lot**. Exits are **1.5×ATR TP / 1.5×ATR SL** (~2.25 / 2.25 pips on a 1.5-pip M5 ATR, ~$2.25 / $2.25). **No new tickets Fri 21:00–Sun 21:00 UTC**; open tickets flatten at the weekend. After a stop, **5 minutes** with no new entry. At most one new ticket per **60 seconds**.
+- London hours only (`7–16 UTC`). Auto-open needs **M5 close vs EMA200**, a **fresh MACD 12/26/9 cross on the correct side of zero**, and **spread ≤ 2 pips**. Entry is the cross-bar close.
+- Size cap is **0.10 lot**. Stop is **beyond the pullback**; take is **1.5R**. **No new tickets Fri 21:00–Sun 21:00 UTC**; open tickets flatten at the weekend. After a stop, **5 minutes** with no new entry. Max **1** ticket per pair; do not open the second pair while the first is live.
 - Closed history can mix old `PAPER-*` tickets, old 10-lot tickets, and current 0.01 tickets.
 
 ---
@@ -222,11 +253,11 @@ SL/TP env pip values are unused for new tickets. Broker stops are **1.5×ATR / 1
 
 - [ ] Analyst is Bill’s H1-with-trend money-management experiment, not a tested edge. No walk-forward, no spread/commission model, no hold-out. The source video is not a live audited result.
 - [x] Python poll aligned to 1s (thread sleep, not a native tick stream).
-- [x] Python owns 1.5×ATR TP / 1.5×ATR SL (1:1). The Expert does not trade.
-- [x] Session defaults to London/NY (`SESSION_START_HOUR=7`, `SESSION_END_HOUR=21`). No news filter, no rollover, no Monday open.
-- [x] ATR floor is 1 pip (was 6). Quiet tape can still fail if H1 is flat.
-- [x] Open gate is H1+H4 trend + 60s clock, not score 4/8 and not M5 candle color.
-- [x] Size cap is 0.10 lot, up to 8 tickets. Bigger than a $1 micro scalp, not 10-lot stacking.
+- [x] Python owns 0.5×ATR TP / 2.8×ATR SL (high-hit scalp). The Expert does not trade.
+- [x] Session defaults to London/NY (`SESSION_START_HOUR=7`, `SESSION_END_HOUR=20 SESSION_END_MINUTE=20`). No news filter, no rollover, no Monday open.
+- [x] ATR floor is 3.0 pips so dead tape actually blocks.
+- [x] Open gate is H1+H4 trend + M5 EMA21 pullback, not a 60s clock and not score 4/8.
+- [x] Size cap is 0.10 lot, max 1 ticket per pair (UI clamp 1–2). No averaging into losers.
 - [x] `decide()` and `bot/strategy.py` removed. Risk is gates only; analyst owns signal.
 
 ### Execution
@@ -274,7 +305,7 @@ SL/TP env pip values are unused for new tickets. Broker stops are **1.5×ATR / 1
 1. **One desk.** Done — Python is the only bot. Expert is display-only.
 2. **Unify exits.** Done — ATR multiples (2.0× TP / 1.5× SL), not % of price.
 3. **Honest size.** Cap is **0.10**. Do not silently restore 10 lots.
-4. **Bill the Bot.** Done on demo from [the 1-hour video](https://www.youtube.com/watch?v=BIGVu71IT1w): multi-TF trend, clock entries, 1:1 ATR, London/NY, scale-in. Not a promise of the video’s $1000/2h.
+4. **MACD Bill on demo.** M5 EMA200 + MACD 12/26/9, pullback SL, 1.5R TP, max 1 ticket. Not a proven edge.
 4. **Same-score test.** Fixture of M5 bars → expected score; assert Python and a documented MQL5 port match.
 5. **Refresh README** from this file so the runbook is not lying.
 6. **Only then** consider a different symbol/timeframe or a real backtest — not more lot size.

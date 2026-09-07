@@ -18,11 +18,11 @@ class FakeEngine:
         self.calls.append("step")
         return {"ok": True, "message": "stepped"}
 
-    def manual_buy(self):
+    def manual_buy(self, symbol=None):
         self.calls.append("buy")
         return {"ok": True, "message": "paper BUY", "ticket": "PAPER-1"}
 
-    def manual_sell(self):
+    def manual_sell(self, symbol=None):
         self.calls.append("sell")
         return {"ok": True, "message": "paper SELL", "ticket": "PAPER-2"}
 
@@ -41,6 +41,10 @@ class FakeEngine:
     def set_fill_venue(self, venue: str):
         self.calls.append(("fill_venue", venue))
         return {"ok": True, "fill_venue": venue, "message": "fills are PAPER"}
+
+    def set_focus(self, symbol: str):
+        self.calls.append(("focus", symbol))
+        return {"ok": True, "focus": symbol}
 
     def retry_mt5(self):
         self.calls.append("reconnect")

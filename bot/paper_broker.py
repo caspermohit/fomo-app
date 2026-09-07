@@ -10,7 +10,7 @@ import requests
 
 from bot.broker import AccountSnapshot, ClosedTrade, OrderResult, Position
 from bot.config import Settings
-from bot.risk import pip_size
+from bot.risk import is_gold, pip_size, pip_value_per_lot
 
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
@@ -61,8 +61,8 @@ class PaperBroker:
     def disconnect(self) -> None:
         self._save()
 
-    def _yahoo_chart(self, interval: str, range_: str) -> dict:
-        ticker = f"{self.settings.symbol}=X"
+    def _yahoo_chart(self, symbol: str, interval: str, range_: str) -> dict:
+        ticker = f"{symbol}=X"
         r = requests.get(
             YAHOO_CHART.format(ticker=ticker),
             params={"interval": interval, "range": range_},
@@ -75,11 +75,11 @@ class PaperBroker:
     def bars(self, symbol: str, count: int = 200, timeframe: str = "M5") -> pd.DataFrame:
         tf_name = (timeframe or "M5").upper()
         if tf_name == "H1":
-            payload = self._yahoo_chart("60m", "60d")
+            payload = self._yahoo_chart(symbol, "60m", "60d")
         elif tf_name == "H4":
-            payload = self._yahoo_chart("60m", "60d")
+            payload = self._yahoo_chart(symbol, "60m", "60d")
         else:
-            payload = self._yahoo_chart("5m", "5d")
+            payload = self._yahoo_chart(symbol, "5m", "5d")
         result = payload["chart"]["result"][0]
         quotes = result["indicators"]["quote"][0]
         rows = []
@@ -109,33 +109,35 @@ class PaperBroker:
         return df.tail(count).reset_index(drop=True)
 
     def tick(self, symbol: str) -> tuple[float, float]:
-        payload = self._yahoo_chart("1m", "1d")
+        payload = self._yahoo_chart(symbol, "1m", "1d")
         meta = payload["chart"]["result"][0]["meta"]
         price = float(meta.get("regularMarketPrice") or meta.get("previousClose"))
-        spread = pip_size(symbol) * 1.2
+        # Gold really trades ~40 pips ($0.40) wide; FX ~1.2 pips.
+        spread = pip_size(symbol) * (40.0 if is_gold(symbol) else 1.2)
         return price - spread / 2, price + spread / 2
 
     def _equity(self) -> float:
         equity = float(self._data["balance"])
         if not self._data["positions"]:
             return equity
-        bid, ask = self.tick(self.settings.symbol)
         for pos in self._data["positions"]:
+            bid, ask = self.tick(pos["symbol"])
             price = bid if pos["side"] == "BUY" else ask
             equity += self._pnl(pos, price)
         return round(equity, 2)
 
     def _pnl(self, pos: dict, price: float) -> float:
         direction = 1 if pos["side"] == "BUY" else -1
-        pips = (price - pos["price"]) / pip_size(self.settings.symbol) * direction
-        return pips * pos["volume"] * 10.0
+        pair = pos.get("symbol") or self.settings.symbol
+        pips = (price - pos["price"]) / pip_size(pair) * direction
+        return pips * pos["volume"] * pip_value_per_lot(pair)
 
     def positions(self, symbol: str) -> list[Position]:
         out = []
-        if not self._data["positions"]:
-            return out
-        bid, ask = self.tick(symbol)
         for pos in self._data["positions"]:
+            if pos.get("symbol") != symbol:
+                continue
+            bid, ask = self.tick(symbol)
             price = bid if pos["side"] == "BUY" else ask
             out.append(
                 Position(
@@ -145,6 +147,7 @@ class PaperBroker:
                     price=pos["price"],
                     profit=round(self._pnl(pos, price), 2),
                     ticket=pos["ticket"],
+                    magic=int(pos.get("magic", self.settings.magic)),
                 )
             )
         return out
@@ -152,6 +155,11 @@ class PaperBroker:
     def closed_trades(self, since_ts: int) -> list[ClosedTrade]:
         out = []
         for row in reversed(self._data.get("closed", [])):
+            magic_raw = row.get("magic", self.settings.magic)
+            try:
+                magic = int(magic_raw) if magic_raw is not None else None
+            except (TypeError, ValueError):
+                magic = None
             out.append(
                 ClosedTrade(
                     time=str(row.get("time", "")),
@@ -162,6 +170,8 @@ class PaperBroker:
                     price=float(row.get("price", 0)),
                     profit=float(row.get("profit", 0)),
                     ticket=str(row.get("ticket", "")),
+                    magic=magic,
+                    comment=str(row.get("comment") or "fomo-demo-bot"),
                 )
             )
         return out
@@ -177,6 +187,7 @@ class PaperBroker:
                 "volume": lot,
                 "price": price,
                 "ticket": ticket,
+                "magic": int(self.settings.magic),
                 "sl_pips": sl_pips,
                 "tp_pips": tp_pips,
             }
@@ -217,6 +228,8 @@ class PaperBroker:
                 "price": price,
                 "profit": round(profit, 2),
                 "ticket": ticket,
+                "magic": int(closed_pos.get("magic", self.settings.magic) or self.settings.magic),
+                "comment": "fomo-demo-bot",
             }
         )
         self._data["balance"] = round(float(self._data["balance"]) + profit, 2)
@@ -225,12 +238,18 @@ class PaperBroker:
         return OrderResult(True, f"closed paper {closed_pos['side']} {ticket} pnl {profit:+.2f}")
 
     def close_all(self, symbol: str) -> OrderResult:
-        positions = list(self._data["positions"])
-        if not positions:
-            return OrderResult(True, "no paper positions")
-        bid, ask = self.tick(symbol)
+        keep = []
+        to_close = []
+        for pos in self._data["positions"]:
+            if pos.get("symbol") == symbol:
+                to_close.append(pos)
+            else:
+                keep.append(pos)
+        if not to_close:
+            return OrderResult(True, f"no paper {symbol} positions")
         closed = 0.0
-        for pos in positions:
+        for pos in to_close:
+            bid, ask = self.tick(pos["symbol"])
             price = bid if pos["side"] == "BUY" else ask
             profit = self._pnl(pos, price)
             closed += profit
@@ -245,9 +264,11 @@ class PaperBroker:
                     "price": price,
                     "profit": round(profit, 2),
                     "ticket": pos["ticket"],
+                    "magic": int(pos.get("magic", self.settings.magic) or self.settings.magic),
+                    "comment": "fomo-demo-bot",
                 }
             )
         self._data["balance"] = round(float(self._data["balance"]) + closed, 2)
-        self._data["positions"] = []
+        self._data["positions"] = keep
         self._save()
-        return OrderResult(True, f"closed paper positions, pnl {closed:+.2f}")
+        return OrderResult(True, f"closed paper {symbol} positions, pnl {closed:+.2f}")

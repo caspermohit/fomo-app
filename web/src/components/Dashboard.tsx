@@ -1,28 +1,65 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { drawCandles, drawSpark } from "@/lib/charts";
-import { money, push, sessionPnl, tone } from "@/lib/format";
+import { drawCandles, drawMoneyGraph } from "@/lib/charts";
+import { cash, fmtPx, money, moneyBalanceSeries, push, sessionPnl, tone } from "@/lib/format";
 import { emptyHistory, type ApiResult, type BotState, type HealthReport, type UnlockStatus } from "@/lib/types";
+import { deskWhy, formatMacdWr } from "@/lib/verdict";
+
+function pairList(state: BotState | null): string[] {
+  if (state?.symbols?.length) return state.symbols;
+  return [state?.symbol || "EURUSD"];
+}
+
+function nextFocus(state: BotState | null, override?: string | null): string {
+  const pairs = pairList(state);
+  if (override && pairs.includes(override)) return override;
+  if (state?.focus && pairs.includes(state.focus)) return state.focus;
+  return pairs[0];
+}
+
+function utcClock(now: Date): string {
+  return now.toISOString().slice(11, 19) + " UTC";
+}
+
+function localClock(now: Date): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(now);
+}
 
 export default function Dashboard() {
   const [mounted, setMounted] = useState(false);
   const [state, setState] = useState<BotState | null>(null);
   const [health, setHealth] = useState<HealthReport | null>(null);
-  const [clock, setClock] = useState("00:00:00 UTC");
+  const [clock, setClock] = useState(() => {
+    const now = new Date();
+    return { utc: utcClock(now), local: utcClock(now) };
+  });
   const [flash, setFlash] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [maxPosDraft, setMaxPosDraft] = useState("8");
+  const [focusOverride, setFocusOverride] = useState<string | null>(null);
   const [gate, setGate] = useState<"checking" | "locked" | "open">("checking");
   const [pinRequired, setPinRequired] = useState(false);
   const [pin, setPin] = useState("");
   const [pinError, setPinError] = useState("");
   const hist = useRef(emptyHistory());
   const candlesRef = useRef<HTMLCanvasElement>(null);
-  const sparkRef = useRef<HTMLCanvasElement>(null);
+  const moneyRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     setMounted(true);
+    const tick = () => {
+      const now = new Date();
+      setClock({ utc: utcClock(now), local: localClock(now) });
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
   }, []);
 
   const load = useCallback(async () => {
@@ -39,7 +76,6 @@ export default function Dashboard() {
       if (next.last_price) push(hist.current.px, next.last_price);
       if (a.rsi != null) push(hist.current.rsi, a.rsi);
       if (a.atr_pips != null) push(hist.current.atr, a.atr_pips);
-      setClock(new Date().toISOString().slice(11, 19) + " UTC");
       setState(next);
     } catch {
       // bot API is down; keep last paint
@@ -108,18 +144,26 @@ export default function Dashboard() {
       setMaxPosDraft(String(state.max_positions));
     }
     if (candlesRef.current) {
-      drawCandles(candlesRef.current, state.bars || [], {
-        last: state.last_price,
-        bid: state.bid,
-        ask: state.ask,
-        open: state.positions || [],
-        closed: (state.closed_trades || []).slice(0, 24),
+      const focus = nextFocus(state, focusOverride);
+      const book = state.books?.[focus];
+      drawCandles(candlesRef.current, book?.bars || state.bars || [], {
+        last: book?.last_price ?? state.last_price,
+        bid: book?.bid ?? state.bid,
+        ask: book?.ask ?? state.ask,
+        open: (state.positions || []).filter((p) => !p.symbol || p.symbol === focus),
+        closed: (state.closed_trades || []).filter((t) => !t.symbol || t.symbol === focus).slice(0, 24),
       });
     }
-    if (sparkRef.current) {
-      drawSpark(sparkRef.current, hist.current.px, tone(sessionPnl(state)));
+    if (moneyRef.current) {
+      const start = Number(state.pnl?.start_deposit ?? 100000);
+      const series = moneyBalanceSeries(
+        state.closed_trades || [],
+        start,
+        Number(state.pnl?.floating ?? 0),
+      );
+      drawMoneyGraph(moneyRef.current, series, start);
     }
-  }, [state]);
+  }, [state, focusOverride]);
 
   async function call(path: string, body?: Record<string, unknown>, label = path) {
     setBusy(label);
@@ -212,21 +256,23 @@ export default function Dashboard() {
   }
 
   const today = sessionPnl(state);
-  const analysis = state?.analysis || {};
+  const pairs = pairList(state);
+  const focus = nextFocus(state, focusOverride);
+  const book = state?.books?.[focus];
+  const analysis = book?.analysis || state?.analysis || {};
   const trades = state?.closed_trades || [];
   const open = state?.positions || [];
-  const maxPos = state?.max_positions || 3;
-  const blockers = state?.blockers || [];
-  const checks = analysis.checks || {};
-  const bid = state?.bid != null ? Number(state.bid).toFixed(5) : "—";
-  const ask = state?.ask != null ? Number(state.ask).toFixed(5) : "—";
-  const px = state?.last_price != null ? Number(state.last_price).toFixed(5) : "—";
+  const maxPos = state?.max_positions || 1;
+  const blockers = book?.blockers || state?.blockers || [];
+  const why = deskWhy(state, focus);
+  const bid = fmtPx(focus, book?.bid ?? state?.bid);
+  const ask = fmtPx(focus, book?.ask ?? state?.ask);
+  const px = fmtPx(focus, book?.last_price ?? state?.last_price);
   const offline = !state;
   const mt5 = state?.mt5;
   const mt5On = Boolean(mt5?.attached);
   const fillsInMt5 = Boolean(mt5?.fills_in_terminal);
   const demoBal = mt5On && mt5?.balance != null ? Number(mt5.balance) : null;
-  const demoCredit = mt5On && mt5?.credit != null ? Number(mt5.credit) : null;
   const canTrade = Boolean(state?.running && state?.broker && state.broker !== "offline");
   const lot = state?.next_lot != null ? Number(state.next_lot).toFixed(2) : "—";
   const riskPct = state?.risk_pct != null ? Math.round(Number(state.risk_pct) * 100) : 2;
@@ -286,11 +332,31 @@ export default function Dashboard() {
             </div>
           ) : null}
           <div className="chip hedge">
-            OPEN {open.length}/{maxPos}
+            OPEN {open.length}
           </div>
+          {pairs.map((pair) => (
+            <button
+              key={pair}
+              type="button"
+              className={`chip ${pair === focus ? "live" : ""}`}
+              disabled={!!busy}
+              onClick={() => {
+                setFocusOverride(pair);
+                void call("/api/settings", { focus: pair }, "focus");
+              }}
+            >
+              {pair}
+              {state?.books?.[pair]?.open_count ? ` ${state.books[pair].open_count}` : ""}
+            </button>
+          ))}
           <div className="chip">{state?.trade_mode || "demo"}</div>
           <div className="grow" />
-          <div className="clock">{clock}</div>
+          <div className="clocks">
+            <div className="clock">{clock.utc}</div>
+            <div className={`clock local ${open.length ? "on" : ""}`} title={open.length ? "Ticket open" : "No open ticket"}>
+              {clock.local}
+            </div>
+          </div>
           {pinRequired ? (
             <button type="button" disabled={!!busy} onClick={() => void lockDesk()}>
               LOCK
@@ -310,7 +376,7 @@ export default function Dashboard() {
         </div>
         <div className="headrow">
           <div className="pxbox">
-            <span className="k">{state?.symbol || "EURUSD"} LAST</span>
+            <span className="k">{focus} LAST</span>
             <b>{px}</b>
           </div>
           <div className="pxbox bidbox">
@@ -360,14 +426,10 @@ export default function Dashboard() {
           <div>
             {mt5On
               ? fillsInMt5
-                ? `Fills go into the MetaTrader 5 app. Demo money ${demoBal != null ? demoBal.toFixed(2) : "—"} ${mt5?.currency || ""}` +
-                  (demoCredit ? ` · credit ${demoCredit.toFixed(2)}` : "") +
-                  ` · size is ${riskPct}% of demo equity, lot ${lot}.` +
-                  (mt5?.trade_allowed === false ? " · ALGO TRADING IS OFF — click Algo Trading in MetaTrader so it is green." : "")
-                : `MT5 is quotes + demo balance only. Orders are PAPER and will not hit the demo account. Demo money ${demoBal != null ? demoBal.toFixed(2) : "—"} ${mt5?.currency || ""}` +
-                  (demoCredit ? ` · credit ${demoCredit.toFixed(2)}` : "") +
-                  ` · size is ${riskPct}% of demo equity.`
-              : "The MT5 window can be open and Python still fails to attach. Buys/sells on this desk are PAPER — they will not show in the MetaTrader app. Demo deposit is unknown until attach works."}
+                ? `Fills hit MetaQuotes-Demo · ${riskPct}% risk · lot ${lot}` +
+                  (mt5?.trade_allowed === false ? " · ALGO TRADING OFF" : "")
+                : `MT5 quotes only · orders are PAPER · lot ${lot}`
+              : "MetaTrader not attached — buys/sells stay PAPER."}
           </div>
           <div className="k">
             {(mt5?.login || state?.login || "—") + " @ " + (mt5?.server || state?.server || "MetaQuotes-Demo")}
@@ -416,14 +478,12 @@ export default function Dashboard() {
               </b>
             </div>
           </div>
-          <div className="k">Last price (from /api/state)</div>
-          <canvas ref={sparkRef} className="spark" />
           <div className="reason">{state?.last_reason || (offline ? "waiting for bot API on :5055" : "—")}</div>
         </div>
 
         <div className="card pad chartcard">
           <div className="k">
-            {(state?.symbol || "EURUSD")} M5 · live last + buy/sell marks
+            {focus} M5 · live last + buy/sell marks · Bill pairs {pairs.join(" + ")}
           </div>
           <div className="chartwrap">
             <canvas ref={candlesRef} />
@@ -432,63 +492,66 @@ export default function Dashboard() {
               <div className="mid">{px}</div>
               <div className="bid">BID {bid}</div>
               <div className="k">spread {state?.spread != null ? `${state.spread}` : "—"}</div>
-              {open.map((p) => (
-                <div key={p.ticket} className={p.side === "BUY" ? "bid" : "ask"}>
-                  {p.side} {money(p.profit)}
-                </div>
-              ))}
             </div>
           </div>
         </div>
 
-        <div className="card pad">
-          <div className="k">
-            Bill · H1 {state?.h1 || analysis.checks?.h1 || "—"} + H4 {state?.h4 || analysis.checks?.h4 || "—"}
-            {" "}→ {state?.htf || analysis.checks?.htf || "HOLD"} · clock 60s · 1:1 ATR · London–NY{" "}
-            {state?.session_start_hour ?? 7}–{state?.session_end_hour ?? 21} UTC · risk{" "}
-            {((state?.risk_pct ?? 0.01) * 100).toFixed(0)}% · up to {state?.max_positions ?? 8} tickets
-            · TP {state?.take_atr_mult ?? 1.5}×ATR · SL {state?.stop_atr_mult ?? 1.5}×ATR · lot{" "}
-            {state?.next_lot ?? 0.1}
+        <div className="card pad whypane">
+          <div className="k">Why {focus} is buying or selling · Trading Rush MACD 100-trade · {pairs.join(" + ")}</div>
+          <div className="whynow">{why.now}</div>
+          <div className="whyhead">
+            {focus} · MACD 12/26/9 + EMA200 + zero line
+            {" · H1 "}
+            {why.h1} / H4 {why.h4} display only
+            {" · "}
+            RSI {analysis.rsi != null ? Number(analysis.rsi).toFixed(1) : "—"}
+            {" · ATR "}
+            {analysis.atr_pips != null ? Number(analysis.atr_pips).toFixed(1) : "—"} pip
+            {" · "}
+            {analysis.trend || "—"} trend
           </div>
-          <div className="scoreline">
-            <b>
-              {analysis.action || "HOLD"} · {state?.htf || analysis.checks?.htf || analysis.bias || "FLAT"}
-            </b>
-            <span>
-              RSI {analysis.rsi != null ? Number(analysis.rsi).toFixed(1) : "—"} · ATR{" "}
-              {analysis.atr_pips != null ? Number(analysis.atr_pips).toFixed(1) : "—"} pip · trend{" "}
-              {analysis.trend || "—"}
-            </span>
-          </div>
-          <div className="k">Why auto is blocked</div>
-          <ul className="blockers">
-            {blockers.length ? (
-              blockers.map((b) => <li key={b}>{b}</li>)
-            ) : (
-              <li>no blockers — auto may open on next step</li>
-            )}
-          </ul>
-          <div className="k">Checks</div>
-          <div className="checks">
-            {Object.keys(checks).length
-              ? Object.entries(checks).map(([k, v]) => (
-                  <div key={k}>
-                    <span>{k}</span>
-                    <b>{v}</b>
-                  </div>
-                ))
-              : "—"}
-          </div>
-          {(analysis.reasons || []).length ? (
-            <>
-              <div className="k">Reasons</div>
-              <ul className="blockers">
-                {analysis.reasons!.slice(0, 6).map((r) => (
-                  <li key={r}>{r}</li>
+          <div className="sides">
+            <div className={`sidecard ${why.buy.go ? "go" : "stop"}`}>
+              <div className="k">Buy</div>
+              <b className={why.buy.go ? "bid" : "ask"}>{why.buy.title}</b>
+              <ul>
+                {why.buy.lines.map((line) => (
+                  <li key={line}>{line}</li>
                 ))}
               </ul>
-            </>
-          ) : null}
+            </div>
+            <div className={`sidecard ${why.sell.go ? "go" : "stop"}`}>
+              <div className="k">Sell</div>
+              <b className={why.sell.go ? "ask" : ""}>{why.sell.title}</b>
+              <ul>
+                {why.sell.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          <div className="k">Gates this tick</div>
+          <div className="gates">
+            {why.gates.map((g) => (
+              <div key={g.label} className={`gate ${g.ok ? "ok" : "no"}`}>
+                <span>{g.label}</span>
+                <b>{g.value}</b>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="moneyrow">
+        <div className="card pad">
+          <div className="k">
+            Money graph · Bill Excel · trade number vs demo balance · start{" "}
+            {cash(state?.pnl?.start_deposit ?? 100000)}
+            {state?.pnl?.history_count != null ? ` · ${state.pnl.history_count} closed` : ""}
+            {state?.account?.equity != null ? ` · equity ${cash(state.account.equity)}` : ""}
+            {" · dashed = live floating · demo only"}
+          </div>
+          <canvas ref={moneyRef} className="moneygraph" />
         </div>
       </section>
 
@@ -501,17 +564,17 @@ export default function Dashboard() {
                 type="button"
                 className="buy"
                 disabled={!!busy || !canTrade}
-                onClick={() => call("/api/buy", undefined, "buy")}
+                onClick={() => call("/api/buy", { symbol: focus }, "buy")}
               >
-                BUY {lot}
+                BUY {focus} {lot}
               </button>
               <button
                 type="button"
                 className="sell"
                 disabled={!!busy || !canTrade}
-                onClick={() => call("/api/sell", undefined, "sell")}
+                onClick={() => call("/api/sell", { symbol: focus }, "sell")}
               >
-                SELL {lot}
+                SELL {focus} {lot}
               </button>
               <button type="button" disabled={!!busy || !canTrade} onClick={() => call("/api/step", undefined, "step")}>
                 STEP NOW
@@ -530,21 +593,23 @@ export default function Dashboard() {
             <table>
               <thead>
                 <tr>
+                  <th>Pair</th>
                   <th>Ticket</th>
                   <th>Side</th>
                   <th>Vol</th>
                   <th>Entry</th>
                   <th>PnL</th>
                   <th>Verdict</th>
+                  <th>MACD WR</th>
                   <th />
                 </tr>
               </thead>
               <tbody>
                 {open.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="empty">
+                    <td colSpan={9} className="empty">
                       {canTrade
-                        ? `No open tickets. Manual BUY/SELL ignores analyst HOLD. Cap ${maxPos}. Mix BUY/SELL blocked.`
+                        ? `No open tickets. Manual BUY/SELL is for ${focus}. Cap ${maxPos} total; max 1 per pair. Mix BUY/SELL blocked on the same pair.`
                         : state?.running
                           ? "Connecting broker… BUY/SELL unlocks after MT5 or paper is ready."
                           : "Press START so the bot connects a broker, then BUY/SELL will fill."}
@@ -553,12 +618,36 @@ export default function Dashboard() {
                 ) : (
                   open.map((p) => (
                     <tr key={p.ticket}>
+                      <td>{p.symbol || focus}</td>
                       <td>{p.ticket}</td>
                       <td className={p.side === "BUY" ? "bid" : "ask"}>{p.side}</td>
                       <td>{p.volume}</td>
-                      <td>{Number(p.price).toFixed(5)}</td>
+                      <td>{fmtPx(p.symbol || focus, p.price)}</td>
                       <td style={{ color: tone(p.profit) }}>{money(p.profit)}</td>
                       <td className="why">{p.why || p.verdict || "—"}</td>
+                      <td className="why">
+                        {(() => {
+                          const sym = String(p.symbol || focus || "").toUpperCase();
+                          const book = state?.books?.[sym];
+                          const overall = formatMacdWr(state?.macd_win_rate, state?.macd_wins, state?.macd_fills, "This system");
+                          const pairFills = book?.macd_fills ?? state?.macd_by_symbol?.[sym]?.macd_fills ?? 0;
+                          if (pairFills > 0) {
+                            const pairLabel = formatMacdWr(
+                              book?.macd_win_rate ?? state?.macd_by_symbol?.[sym]?.macd_win_rate,
+                              book?.macd_wins ?? state?.macd_by_symbol?.[sym]?.macd_wins,
+                              pairFills,
+                              sym,
+                            );
+                            return (
+                              <>
+                                <div>{overall}</div>
+                                <div className="k">{pairLabel}</div>
+                              </>
+                            );
+                          }
+                          return overall;
+                        })()}
+                      </td>
                       <td>
                         <button
                           type="button"
@@ -588,6 +677,7 @@ export default function Dashboard() {
               <thead>
                 <tr>
                   <th>Time UTC</th>
+                  <th>Pair</th>
                   <th>Side</th>
                   <th>Vol</th>
                   <th>Price</th>
@@ -598,7 +688,7 @@ export default function Dashboard() {
               <tbody>
                 {trades.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="empty">
+                    <td colSpan={7} className="empty">
                       No closed trades in history
                     </td>
                   </tr>
@@ -609,9 +699,10 @@ export default function Dashboard() {
                     return (
                       <tr key={t.ticket || i} className={row}>
                         <td>{t.time || "—"}</td>
+                        <td>{t.symbol || "—"}</td>
                         <td>{t.side}</td>
                         <td>{t.volume}</td>
-                        <td>{t.price != null ? Number(t.price).toFixed(5) : "—"}</td>
+                        <td>{t.price != null ? fmtPx(t.symbol, t.price) : "—"}</td>
                         <td className="cash">{money(t.profit)}</td>
                         <td>{t.ticket}</td>
                       </tr>
@@ -628,11 +719,11 @@ export default function Dashboard() {
         <div className="card pad">
           <div className="k">Settings · POST /api/settings</div>
           <label className="field">
-            Max open tickets
+            Max open tickets total (max 2)
             <input
               type="number"
               min={1}
-              max={8}
+              max={2}
               value={maxPosDraft}
               onChange={(e) => setMaxPosDraft(e.target.value)}
             />
@@ -667,6 +758,8 @@ export default function Dashboard() {
             poll {state?.poll_seconds || "—"}s · lot {lot} · {riskPct}% of demo · SL {analysis.sl_pips ?? "—"} / TP{" "}
             {analysis.tp_pips ?? "—"} pips
             <br />
+            Peak giveback: arm ${state?.profit_arm_usd ?? 3} · giveback {Number(state?.profit_giveback_pct ?? 0.35) * 100}%
+            <br />
             {fillsInMt5
               ? "BUY/SELL hits the MetaQuotes demo account."
               : "BUY/SELL stays on paper even if MetaTrader is connected."}
@@ -691,7 +784,7 @@ export default function Dashboard() {
       </section>
 
       <footer>
-        <div>FOMO DEMO · UI DRIVES /api/* · TREND+RSI+ATR</div>
+        <div>FOMO DEMO · UI DRIVES /api/* · MACD+EMA200</div>
         <div className="feed">{blockers[0] || state?.last_reason || "ready"}</div>
         <div>
           {state?.account ? `${state.account.login} @ ${state.account.server}` : "offline"} · {state?.broker || "down"}

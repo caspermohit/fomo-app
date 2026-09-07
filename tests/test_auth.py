@@ -70,3 +70,11 @@ def test_no_pin_stays_open(monkeypatch):
     client = create_app(FakeEngine()).test_client()
     assert client.get("/api/state").status_code == 200
     assert client.get("/api/unlock").json["required"] is False
+
+
+def test_localhost_cookie_not_secure(monkeypatch):
+    client = _client(monkeypatch)
+    res = client.post("/api/unlock", json={"pin": "2468"})
+    cookie = ";".join(res.headers.getlist("Set-Cookie"))
+    assert "fomo_desk=" in cookie
+    assert "Secure" not in cookie

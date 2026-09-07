@@ -5,18 +5,43 @@ from typing import Any
 
 import pandas as pd
 
-from bot.risk import Action, Signal, pip_size
+from bot.risk import Action, Signal, is_gold, is_jpy_pair, pip_size, pip_value_per_lot
 
 MICRO_LOT = 0.01
-TAKE_ATR_MULT = 1.5
+# Trading Rush MACD 100-trade test:
+# https://tradingrush.net/i-risked-macd-trading-strategy-100-times-heres-what-happened/
+# Trend: close vs EMA200. Entry: default MACD 12/26/9 cross on the correct side of zero.
+# BUY: cross above signal, below zero, price above EMA200.
+# SELL: cross below signal, above zero, price below EMA200.
+# Stop beyond the pullback. Take 1.5R (the backtest clip). Not H1/H4, not ATR chop, not RSI.
+TAKE_ATR_MULT = 1.5  # kept for older tests / unused as primary SL
 STOP_ATR_MULT = 1.5
-PIP_VALUE_PER_LOT = 10.0
+REWARD_R = 1.5
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+EMA_TREND = 200
+SWING_BARS = 5
+STOP_BUFFER_PIPS = 1.0
+MIN_BARS = 210
+PIP_VALUE_PER_LOT = 10.0  # EURUSD default; JPY uses pip_value_per_lot()
 MIN_OPEN_SCORE = 4
+EUR_ATR_FLOOR = 4.0
+JPY_ATR_FLOOR = 8.0
+# XAUUSD pips are $0.01, so an FX-scale floor would wave every dead tape through.
+# Measured on 3000 MetaQuotes-Demo M5 bars (19 Aug - 3 Sep 2026), 07:00-16:00 UTC:
+# min 247, p25 420, median 551, p75 753, p95 1046 pips ($2.47 / $4.20 / $5.51 ...).
+# 500 pips = $5.00 M5 ATR ~ 0.9x the session median. It blocks the dead bottom
+# ~40% of the tape while keeping spread (~43 pips) under ~9% of ATR, the same
+# spread-to-ATR band EURUSD (4.0) and GBPJPY (8.0) already run at.
+GOLD_ATR_FLOOR = 500.0
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
 
 
 @dataclass(frozen=True)
 class ExitSpec:
-    """One exit model: ATR multiples → pips → dollars. Not % of EURUSD."""
+    """SL/TP in pips and dollars. Primary path is pullback distance, not ATR."""
 
     sl_pips: float
     tp_pips: float
@@ -28,9 +53,27 @@ def volume_scale(volume: float) -> float:
     return max(float(volume) / MICRO_LOT, MICRO_LOT)
 
 
-def pip_dollar_exits(volume: float, sl_pips: float, tp_pips: float) -> tuple[float, float]:
-    pip_value = PIP_VALUE_PER_LOT * max(float(volume), 0.0)
-    return float(tp_pips) * pip_value, float(sl_pips) * pip_value
+def min_atr_floor(symbol: str, configured: float = 1.0) -> float:
+    if is_gold(symbol):
+        pair_min = GOLD_ATR_FLOOR
+    elif is_jpy_pair(symbol):
+        pair_min = JPY_ATR_FLOOR
+    else:
+        pair_min = EUR_ATR_FLOOR
+    return max(float(configured), pair_min)
+
+
+def pip_dollar_exits(
+    volume: float,
+    sl_pips: float,
+    tp_pips: float,
+    symbol: str = "EURUSD",
+    pip_value: float | None = None,
+    usd_jpy: float | None = None,
+) -> tuple[float, float]:
+    pv = float(pip_value) if pip_value is not None else pip_value_per_lot(symbol, usd_jpy=usd_jpy)
+    pip_dollars = pv * max(float(volume), 0.0)
+    return float(tp_pips) * pip_dollars, float(sl_pips) * pip_dollars
 
 
 def exits_from_atr(
@@ -38,11 +81,14 @@ def exits_from_atr(
     atr_pips: float,
     take_mult: float = TAKE_ATR_MULT,
     stop_mult: float = STOP_ATR_MULT,
+    symbol: str = "EURUSD",
+    pip_value: float | None = None,
+    usd_jpy: float | None = None,
 ) -> ExitSpec:
     atr = max(float(atr_pips), 0.1)
     sl_pips = atr * float(stop_mult)
     tp_pips = atr * float(take_mult)
-    take_usd, cut_usd = pip_dollar_exits(volume, sl_pips, tp_pips)
+    take_usd, cut_usd = pip_dollar_exits(volume, sl_pips, tp_pips, symbol=symbol, pip_value=pip_value, usd_jpy=usd_jpy)
     return ExitSpec(sl_pips, tp_pips, take_usd, cut_usd)
 
 
@@ -50,9 +96,26 @@ def atr_dollar_exits(
     volume: float,
     sl_pips: float,
     tp_pips: float,
+    symbol: str = "EURUSD",
+    pip_value: float | None = None,
+    usd_jpy: float | None = None,
     **_ignored,
 ) -> tuple[float, float]:
-    return pip_dollar_exits(volume, sl_pips, tp_pips)
+    return pip_dollar_exits(volume, sl_pips, tp_pips, symbol=symbol, pip_value=pip_value, usd_jpy=usd_jpy)
+
+
+def exits_from_pullback(
+    volume: float,
+    sl_pips: float,
+    reward_r: float = REWARD_R,
+    symbol: str = "EURUSD",
+    pip_value: float | None = None,
+    usd_jpy: float | None = None,
+) -> ExitSpec:
+    sl = max(float(sl_pips), 1.0)
+    tp = sl * float(reward_r)
+    take_usd, cut_usd = pip_dollar_exits(volume, sl, tp, symbol=symbol, pip_value=pip_value, usd_jpy=usd_jpy)
+    return ExitSpec(sl, tp, take_usd, cut_usd)
 
 
 @dataclass
@@ -109,8 +172,73 @@ def atr_pips(bars: pd.DataFrame, symbol: str, period: int = 14) -> float:
     return max(atr / pip_size(symbol), 1.0)
 
 
+def macd_lines(close: pd.Series, fast: int = MACD_FAST, slow: int = MACD_SLOW, signal: int = MACD_SIGNAL) -> tuple[pd.Series, pd.Series]:
+    """Standard MACD 12/26/9: MACD line = EMA12−EMA26, signal = EMA9 of MACD."""
+    line = ema(close.astype(float), fast) - ema(close.astype(float), slow)
+    sig = ema(line, signal)
+    return line, sig
+
+
+def macd_cross(line: pd.Series, signal: pd.Series) -> Signal:
+    """Cross on the last two values. HOLD if there is no cross."""
+    if line is None or signal is None or len(line) < 2 or len(signal) < 2:
+        return "HOLD"
+    prev_m, last_m = float(line.iloc[-2]), float(line.iloc[-1])
+    prev_s, last_s = float(signal.iloc[-2]), float(signal.iloc[-1])
+    if prev_m <= prev_s and last_m > last_s:
+        return "BUY"
+    if prev_m >= prev_s and last_m < last_s:
+        return "SELL"
+    return "HOLD"
+
+
+def closed_bars(bars: pd.DataFrame, now=None, tf_minutes: int = 5) -> pd.DataFrame:
+    """Drop the forming M5 bar so entry is on the cross-bar close."""
+    if bars is None or bars.empty or "time" not in bars.columns or now is None:
+        return bars
+    ts = pd.Timestamp(now)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    last = pd.Timestamp(bars["time"].iloc[-1])
+    if last.tzinfo is None:
+        last = last.tz_localize("UTC")
+    elif last.tzinfo is not None and ts.tzinfo is not None:
+        last = last.tz_convert("UTC")
+        ts = ts.tz_convert("UTC")
+    if ts - last < pd.Timedelta(minutes=tf_minutes):
+        return bars.iloc[:-1].copy()
+    return bars
+
+
+def htf_agrees(side: Signal, higher_tf=None, h1=None, h4=None) -> tuple[bool, str]:
+    """Display-only. The 100-trade article does not use H1/H4 as an entry gate."""
+    if side not in {"BUY", "SELL"}:
+        return True, ""
+    raw: list[tuple[str, str]] = []
+    for name, val in (("H1", h1), ("H4", h4)):
+        if val in {"BUY", "SELL", "HOLD"}:
+            raw.append((name, str(val)))
+    if not raw and higher_tf in {"BUY", "SELL", "HOLD"}:
+        raw.append(("HTF", str(higher_tf)))
+    if not raw:
+        return True, ""
+    for _name, val in raw:
+        if val != side:
+            detail = " / ".join(f"{n} {v}" for n, v in raw)
+            return False, f"HTF gate: {detail} does not agree with MACD {side}"
+    return True, ""
+
+
+def rsi_exhausted(side: Signal, rsi_now: float) -> str | None:
+    if side == "BUY" and rsi_now > RSI_OVERBOUGHT:
+        return f"RSI(14) {rsi_now:.0f} > 70 — skip exhausted BUY"
+    if side == "SELL" and rsi_now < RSI_OVERSOLD:
+        return f"RSI(14) {rsi_now:.0f} < 30 — skip exhausted SELL"
+    return None
+
+
 def htf_bias(bars: pd.DataFrame) -> Signal:
-    """Higher-timeframe direction. Bill only trades this way, not against it."""
+    """Higher-timeframe EMA21 direction. Shown on the desk; not an open gate."""
     if bars is None or len(bars) < 25 or "close" not in bars.columns:
         return "HOLD"
     close = bars["close"].astype(float)
@@ -124,7 +252,6 @@ def htf_bias(bars: pd.DataFrame) -> Signal:
 
 
 def multi_tf_bias(h1: pd.DataFrame, h4: pd.DataFrame | None = None) -> tuple[Signal, Signal, Signal]:
-    """Bill needs the trend on more than one timeframe. Return (combined, H1, H4)."""
     one = htf_bias(h1)
     two = htf_bias(h4) if h4 is not None else one
     if one == two and one in {"BUY", "SELL"}:
@@ -147,7 +274,6 @@ def resample_ohlc(bars: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 
 def m5_to_h1(bars: pd.DataFrame) -> pd.DataFrame:
-    """Build H1 OHLC from M5 when the terminal has no H1 history."""
     return resample_ohlc(bars, "1h")
 
 
@@ -170,11 +296,29 @@ def ema_crossover(bars: pd.DataFrame, fast: int = 9, slow: int = 21) -> Signal:
     return "HOLD"
 
 
+def pullback_stop_pips(bars: pd.DataFrame, symbol: str, side: Signal, entry: float, ema200: float) -> float:
+    """Stop beyond the pullback: last-5 swing and EMA200, whichever is further, plus 1 pip."""
+    pip = pip_size(symbol)
+    window = bars.tail(SWING_BARS)
+    buf = STOP_BUFFER_PIPS * pip
+    if side == "BUY":
+        swing = float(window["low"].min())
+        stop = min(swing, float(ema200)) - buf
+        dist = float(entry) - stop
+    else:
+        swing = float(window["high"].max())
+        stop = max(swing, float(ema200)) + buf
+        dist = stop - float(entry)
+    return max(dist / pip, 1.0)
+
+
 def _session_ok(
     bars: pd.DataFrame,
     start_hour: int = 0,
     end_hour: int = 24,
     now=None,
+    start_minute: int = 0,
+    end_minute: int = 0,
 ) -> bool:
     if start_hour <= 0 and end_hour >= 24:
         return True
@@ -186,12 +330,24 @@ def _session_ok(
         ts = pd.Timestamp(bars["time"].iloc[-1])
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
-    hour = int(ts.tz_convert("UTC").hour)
-    if start_hour == end_hour:
+    utc = ts.tz_convert("UTC")
+    now_m = int(utc.hour) * 60 + int(utc.minute)
+    start_m = int(start_hour) * 60 + max(0, min(59, int(start_minute)))
+    end_m = int(end_hour) * 60 + max(0, min(59, int(end_minute)))
+    if start_m == end_m:
         return True
-    if start_hour < end_hour:
-        return start_hour <= hour < end_hour
-    return hour >= start_hour or hour < end_hour
+    if start_m < end_m:
+        return start_m <= now_m <= end_m
+    return now_m >= start_m or now_m <= end_m
+
+
+def _bar_stamp(bars: pd.DataFrame) -> str:
+    if bars is None or bars.empty or "time" not in bars.columns:
+        return ""
+    ts = pd.Timestamp(bars["time"].iloc[-1])
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def analyze(
@@ -204,6 +360,8 @@ def analyze(
     open_count: int = 0,
     session_start_hour: int = 0,
     session_end_hour: int = 24,
+    session_start_minute: int = 0,
+    session_end_minute: int = 0,
     min_atr_pips: float = 1.0,
     min_score: int = MIN_OPEN_SCORE,
     take_atr_mult: float = TAKE_ATR_MULT,
@@ -214,30 +372,51 @@ def analyze(
     max_spread_pips: float = 2.0,
     htf_h1: Signal | None = None,
     htf_h4: Signal | None = None,
+    position_sl_pips: float | None = None,
+    position_tp_pips: float | None = None,
+    usd_jpy: float | None = None,
+    pip_value: float | None = None,
 ) -> Analysis:
     empty = Analysis("HOLD", "HOLD", 0, 20, 30, "unknown", 50.0, 20.0, ["not enough bars"], {})
-    if bars is None or len(bars) < 60 or not {"open", "high", "low", "close"} <= set(bars.columns):
+    frame = closed_bars(bars, now=now) if bars is not None else bars
+    pv = float(pip_value) if pip_value is not None else pip_value_per_lot(symbol, usd_jpy=usd_jpy)
+    need_atr = min_atr_floor(symbol, min_atr_pips)
+    exit_kw = {"symbol": symbol, "pip_value": pv, "usd_jpy": usd_jpy}
+    if frame is None or len(frame) < MIN_BARS or not {"open", "high", "low", "close"} <= set(frame.columns):
+        if position_side and position_sl_pips and position_tp_pips:
+            spec = exits_from_pullback(position_volume, position_sl_pips, position_tp_pips / position_sl_pips if position_sl_pips else REWARD_R, **exit_kw)
+            pnl_tag = f"${position_profit:+.2f}"
+            if position_profit >= spec.take_usd:
+                return Analysis("CLOSE", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"take profit 1.5R: open P&L {pnl_tag}"], {"verdict": "bank"})
+            if position_profit <= -spec.cut_usd:
+                return Analysis("CLOSE", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"stop loss pullback: open P&L {pnl_tag}"], {"verdict": "cut"})
+            return Analysis("HOLD", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"hold {position_side}: open P&L {pnl_tag} — 1.5R vs pullback SL"], {"verdict": "hold"})
         return empty
 
-    close = bars["close"].astype(float)
-    open_ = bars["open"].astype(float)
+    close = frame["close"].astype(float)
+    open_ = frame["open"].astype(float)
     e9, e21, e50 = ema(close, 9), ema(close, 21), ema(close, 50)
+    e200 = ema(close, EMA_TREND)
     rsi_val = rsi(close).iloc[-1]
     rsi_now = float(rsi_val) if pd.notna(rsi_val) else 50.0
-    atr = atr_pips(bars, symbol)
+    atr = atr_pips(frame, symbol)
     price = float(close.iloc[-1])
-    spec = exits_from_atr(position_volume, atr, take_atr_mult, stop_atr_mult)
-    sl, tp = spec.sl_pips, spec.tp_pips
+    ema200 = float(e200.iloc[-1])
     last_open = float(open_.iloc[-1])
     bullish = price > last_open
-    in_session = _session_ok(bars, session_start_hour, session_end_hour, now=now)
+    in_session = _session_ok(frame, session_start_hour, session_end_hour, now=now, start_minute=session_start_minute, end_minute=session_end_minute)
+    line, sig = macd_lines(close)
+    last_macd = float(line.iloc[-1])
+    last_sig = float(sig.iloc[-1])
+    cross = macd_cross(line, sig)
+    trend_side: Signal = "BUY" if price > ema200 else "SELL" if price < ema200 else "HOLD"
+    trend = "up" if trend_side == "BUY" else "down" if trend_side == "SELL" else "range"
 
-    if price > float(e50.iloc[-1]) and float(e9.iloc[-1]) > float(e21.iloc[-1]):
-        trend = "up"
-    elif price < float(e50.iloc[-1]) and float(e9.iloc[-1]) < float(e21.iloc[-1]):
-        trend = "down"
-    else:
-        trend = "range"
+    sl = 20.0
+    tp = 30.0
+    if trend_side in {"BUY", "SELL"}:
+        spec_pb = exits_from_pullback(position_volume, pullback_stop_pips(frame, symbol, trend_side, price, ema200), **exit_kw)
+        sl, tp = spec_pb.sl_pips, spec_pb.tp_pips
 
     checks = {
         "trend": trend,
@@ -247,12 +426,21 @@ def analyze(
             "in window" if in_session else "outside window"
         ),
         "candle": "bullish" if bullish else "bearish",
-        "tp": f"{take_atr_mult:g}×ATR",
-        "sl": f"{stop_atr_mult:g}×ATR",
+        "tp": "1.5R",
+        "sl": "pullback",
         "htf": higher_tf or "n/a",
         "h1": htf_h1 or "n/a",
         "h4": htf_h4 or "n/a",
         "spread": "n/a" if spread_pips is None else f"{spread_pips:.1f} pips",
+        "ema200": "above" if price > ema200 else "below" if price < ema200 else "flat",
+        "macd": f"{last_macd:.6f}",
+        "macd_signal": f"{last_sig:.6f}",
+        "macd_cross": cross,
+        "zero": "below" if last_macd < 0 else "above" if last_macd > 0 else "zero",
+        "cross_bar": _bar_stamp(frame),
+        "strategy": "macd",
+        "pip_value": f"{pv:.2f}",
+        "atr_floor": f"{need_atr:.1f}",
     }
     reasons: list[str] = []
     buy = 0
@@ -260,129 +448,89 @@ def analyze(
 
     if trend == "up":
         buy += 2
-        reasons.append("uptrend vs EMA50")
+        reasons.append("price above M5 EMA200")
     elif trend == "down":
         sell += 2
-        reasons.append("downtrend vs EMA50")
+        reasons.append("price below M5 EMA200")
     else:
-        reasons.append("no clear trend — wait")
+        reasons.append("price on EMA200 — no trend")
 
-    if float(e9.iloc[-1]) > float(e21.iloc[-1]):
+    if last_macd > last_sig:
         buy += 1
     else:
         sell += 1
 
-    if 42 <= rsi_now <= 62:
-        buy += 1
-        sell += 1
-        reasons.append("RSI is mid-trend, not exhausted")
-    elif rsi_now >= 70:
-        sell += 2
-        buy -= 2
-        reasons.append("RSI overbought — prefer sell or wait")
-    elif rsi_now <= 30:
-        buy += 2
-        sell -= 2
-        reasons.append("RSI oversold — prefer buy or wait")
-
-    if bullish:
-        buy += 1
-    else:
-        sell += 1
-
-    if price > float(e9.iloc[-1]):
-        buy += 1
-    else:
-        sell += 1
-
-    if atr < min_atr_pips:
-        buy -= 2
-        sell -= 2
-        reasons.append("ATR too small, market is chopping")
+    if atr < need_atr:
         checks["volatility"] = "low"
     else:
         checks["volatility"] = "ok"
 
     if not in_session:
-        buy -= 2
-        sell -= 2
         reasons.append("outside the configured session window")
 
-    cross = ema_crossover(bars)
     if cross == "BUY":
-        buy += 2
-        reasons.append("EMA 9 crossed above 21")
+        reasons.append("MACD crossed above signal")
     elif cross == "SELL":
-        sell += 2
-        reasons.append("EMA 9 crossed below 21")
+        reasons.append("MACD crossed below signal")
 
-    bias: Signal = "HOLD"
-    if buy >= sell + 2 and buy >= 4:
-        bias = "BUY"
-    elif sell >= buy + 2 and sell >= 4:
-        bias = "SELL"
-
+    bias: Signal = trend_side if trend_side in {"BUY", "SELL"} else "HOLD"
     action: Action = "HOLD"
-    confidence = max(buy, sell)
+    confidence = 8 if cross in {"BUY", "SELL"} and cross == trend_side else max(buy, sell)
 
     if position_side:
-        take_usd, cut_usd = spec.take_usd, spec.cut_usd
+        use_sl = float(position_sl_pips) if position_sl_pips else sl
+        use_tp = float(position_tp_pips) if position_tp_pips else tp
+        spec = exits_from_pullback(position_volume, use_sl, use_tp / use_sl if use_sl else REWARD_R, **exit_kw)
+        sl, tp = spec.sl_pips, spec.tp_pips
         pnl_tag = f"${position_profit:+.2f}"
         checks["open_pnl"] = pnl_tag
-        checks["take_usd"] = f"{take_usd:.2f}"
-        checks["cut_usd"] = f"{cut_usd:.2f}"
+        checks["take_usd"] = f"{spec.take_usd:.2f}"
+        checks["cut_usd"] = f"{spec.cut_usd:.2f}"
         checks["verdict"] = "hold"
-        if position_profit >= take_usd:
+        if position_profit >= spec.take_usd:
             action = "CLOSE"
             checks["verdict"] = "bank"
-            reasons.insert(0, f"take profit {take_atr_mult:g}×ATR: open P&L {pnl_tag}")
-        elif position_profit <= -cut_usd:
+            reasons.insert(0, f"take profit 1.5R: open P&L {pnl_tag}")
+        elif position_profit <= -spec.cut_usd:
             action = "CLOSE"
             checks["verdict"] = "cut"
-            reasons.insert(0, f"stop loss {stop_atr_mult:g}×ATR: open P&L {pnl_tag}")
+            reasons.insert(0, f"stop loss pullback: open P&L {pnl_tag}")
         else:
             action = "HOLD"
-            reasons.insert(0, f"hold {position_side}: open P&L {pnl_tag} — TP {take_atr_mult:g}×ATR / SL {stop_atr_mult:g}×ATR")
+            reasons.insert(0, f"hold {position_side}: open P&L {pnl_tag} — 1.5R vs pullback SL")
         return Analysis(action, bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
-    if higher_tf is not None:
-        checks["htf"] = higher_tf
-        if htf_h1:
-            checks["h1"] = htf_h1
-        if htf_h4:
-            checks["h4"] = htf_h4
-        if not in_session or atr < min_atr_pips:
-            return Analysis(
-                "HOLD",
-                higher_tf if higher_tf in {"BUY", "SELL"} else "HOLD",
-                confidence,
-                sl,
-                tp,
-                trend,
-                rsi_now,
-                atr,
-                reasons[:8],
-                checks,
-            )
-        if spread_pips is not None and spread_pips > max_spread_pips:
-            reasons.append(f"spread {spread_pips:.1f} pips — Bill only trades when London/NY spreads are tight")
-            return Analysis("HOLD", higher_tf if higher_tf in {"BUY", "SELL"} else "HOLD", confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
-        if higher_tf not in {"BUY", "SELL"}:
-            reasons.append("H1 and H4 disagree or are flat — Bill only trades a multi-timeframe trend")
-            return Analysis("HOLD", "HOLD", confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
-        reasons.insert(0, f"open {higher_tf}: multi-TF trend (Bill) — clock entry, no candle signal")
-        return Analysis(higher_tf, higher_tf, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
-
-    if bias == "HOLD" or not in_session or atr < min_atr_pips:
+    if not in_session:
         return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
-    if confidence < min_score:
-        reasons.append("score too weak to open a trade")
+    if spread_pips is not None and spread_pips > max_spread_pips:
+        reasons.append(f"spread {spread_pips:.1f} pips — skip bad-spread hours")
         return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
-    if open_count > 0 and confidence < 6:
-        reasons.append("score too weak to add another ticket")
+    if cross == "HOLD":
+        reasons.insert(0, "waiting for a fresh MACD 12/26/9 cross")
         return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
-    reasons.insert(0, f"open {bias}: score {confidence}/8")
-    return Analysis(bias, bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+    if cross == "BUY" and last_macd >= 0:
+        reasons.insert(0, "MACD BUY cross is not below the zero line")
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+    if cross == "SELL" and last_macd <= 0:
+        reasons.insert(0, "MACD SELL cross is not above the zero line")
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+
+    if cross == "BUY" and price <= ema200:
+        reasons.insert(0, "MACD BUY but close is not above EMA200")
+        return Analysis("HOLD", "HOLD", confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+    if cross == "SELL" and price >= ema200:
+        reasons.insert(0, "MACD SELL but close is not below EMA200")
+        return Analysis("HOLD", "HOLD", confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+
+    ok_htf, _htf_reason = htf_agrees(cross, higher_tf=higher_tf, h1=htf_h1, h4=htf_h4)
+    checks["htf_gate"] = "ok" if ok_htf else "ignored"
+    tired = rsi_exhausted(cross, rsi_now)
+    checks["rsi_gate"] = "exhaustion" if tired else "ok"
+
+    spec = exits_from_pullback(position_volume, pullback_stop_pips(frame, symbol, cross, price, ema200), **exit_kw)
+    sl, tp = spec.sl_pips, spec.tp_pips
+    reasons.insert(0, f"open {cross}: MACD cross + EMA200 (1.5R vs pullback SL)")
+    return Analysis(cross, cross, 8, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
