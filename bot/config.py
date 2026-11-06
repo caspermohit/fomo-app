@@ -18,6 +18,11 @@ LOG_PATH = DATA_DIR / "bot.log"
 # Bill video 1 pairs + XAUUSD (spot gold on MetaQuotes-Demo, path Metals\XAUUSD).
 BILL_PAIRS = ("EURUSD", "GBPJPY", "XAUUSD")
 
+# Magic this desk has always traded under. Override with MAGIC per machine when
+# more than one bot shares an MT5 login; positions opened under another magic
+# are left alone.
+DEFAULT_MAGIC = 26082601
+
 
 def parse_symbols(symbols_env: str | None) -> tuple[str, ...]:
     """Desk pairs. Unset/blank SYMBOLS → EURUSD+GBPJPY+XAUUSD. Explicit list is allowlisted."""
@@ -29,6 +34,31 @@ def parse_symbols(symbols_env: str | None) -> tuple[str, ...]:
         if name in BILL_PAIRS and name not in out:
             out.append(name)
     return tuple(out) or BILL_PAIRS
+
+
+def parse_strategy(raw: str | None) -> str:
+    """macd (default) | day_range | vwap_ema (Austin VWAP+EMA9)."""
+    text = (raw or "macd").strip().lower().replace("-", "_").replace(" ", "")
+    if text in {"day_range", "dayrange", "crt", "pdh_pdl"}:
+        return "day_range"
+    if text in {"vwap_ema", "vwap", "ema9", "vwap_ema9", "austin"}:
+        return "vwap_ema"
+    return "macd"
+
+
+def parse_news_pairs(raw: str | None) -> tuple[str, ...]:
+    """Pairs that skip around USD prints. Unset → gold only. off/none → nobody."""
+    if raw is None or not str(raw).strip():
+        return ("XAUUSD",)
+    text = str(raw).strip().lower()
+    if text in {"0", "false", "no", "off", "none", "-"}:
+        return ()
+    out: list[str] = []
+    for part in str(raw).replace(";", ",").split(","):
+        name = part.strip().upper()
+        if name in BILL_PAIRS and name not in out:
+            out.append(name)
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -45,10 +75,10 @@ class Settings:
     tp_pips: float
     poll_seconds: int
     dashboard_port: int
-    magic: int = 26082601
-    max_positions: int = 2
-    profit_arm_usd: float = 3.0
-    profit_giveback_pct: float = 0.35
+    magic: int = DEFAULT_MAGIC
+    max_positions: int = 4
+    # Kotegawa/BNF: halt the session at ~2% equity, not a 20% circuit breaker.
+    daily_loss_pct: float = 0.02
     fill_venue: str = "mt5"
     mutex_required: bool = True
     session_start_hour: int = 7
@@ -72,6 +102,23 @@ class Settings:
     history_lookback_days: int = 0
     # Morning MACD Bill went live on this desk (UTC). Used to exclude old Bill closes.
     macd_era_start: str = "2026-09-03T00:00:00+00:00"
+    # DEMO-ONLY optional Kronos-mini agree gate (default off until verified).
+    kronos_filter: bool = False
+    kronos_decisions_path: str = ""
+    kronos_max_age_sec: int = 1800
+    # CHOP = no Kronos opinion. "allow" lets MACD fire; "skip" blocks (old behavior).
+    kronos_chop: str = "allow"
+    max_lot_xau: float = 0.02
+    news_blackout: bool = True
+    news_before_min: int = 30
+    news_after_min: int = 20
+    news_pairs: tuple[str, ...] = ("XAUUSD",)
+    atr_gate: bool = True
+    monday_open_skip_min: int = 30
+    # macd (default) | day_range | vwap_ema. Kronos only for macd.
+    strategy: str = "macd"
+    day_range_mid_band_pct: float = 0.05
+    day_range_timeframe: str = "M15"
     symbols: tuple[str, ...] = ()
 
     @property
@@ -102,15 +149,25 @@ class Settings:
         pair_min = float(self.min_atr_pips_jpy) if is_jpy_pair(symbol) else 4.0
         return max(float(self.min_atr_pips), pair_min)
 
+    def lot_cap(self, symbol: str) -> float:
+        from bot.risk import is_gold
 
-def _positive_float(name: str, default: str) -> float:
+        cap = float(self.max_lot)
+        if is_gold(symbol):
+            xau = float(self.max_lot_xau or 0)
+            if xau > 0:
+                cap = min(cap, xau)
+        return max(0.01, cap)
+
+
+def _unit_pct(name: str, default: str) -> float:
     raw = os.getenv(name, default)
     try:
         value = float(raw)
     except (TypeError, ValueError) as exc:
-        raise SystemExit(f"{name} must be a positive number") from exc
-    if value <= 0:
-        raise SystemExit(f"{name} must be a positive number")
+        raise SystemExit(f"{name} must be a fraction between 0 and 1") from exc
+    if value <= 0 or value >= 1:
+        raise SystemExit(f"{name} must be a fraction between 0 and 1")
     return value
 
 
@@ -151,9 +208,11 @@ def load_settings() -> Settings:
         tp_pips=float(os.getenv("TP_PIPS", "40")),
         poll_seconds=max(1, int(os.getenv("POLL_SECONDS", "1"))),
         dashboard_port=int(os.getenv("DASHBOARD_PORT", "5055")),
-        max_positions=max(1, min(2, int(os.getenv("MAX_POSITIONS", "2")))),
-        profit_arm_usd=_positive_float("PROFIT_ARM_USD", "3.0"),
-        profit_giveback_pct=_positive_float("PROFIT_GIVEBACK_PCT", "0.35"),
+        # Each bot must own a distinct magic when several run on one MT5 login,
+        # otherwise they claim and manage each other's positions.
+        magic=int(os.getenv("MAGIC", str(DEFAULT_MAGIC)) or DEFAULT_MAGIC),
+        max_positions=max(1, min(4, int(os.getenv("MAX_POSITIONS", "4")))),
+        daily_loss_pct=_unit_pct("DAILY_LOSS_PCT", "0.02"),
         fill_venue="mt5" if os.getenv("FILL_VENUE", "mt5").strip().lower() != "paper" else "paper",
         mutex_required=os.getenv("EXECUTION_MUTEX_REQUIRED", "true").strip().lower() not in {"0", "false", "no"},
         session_start_hour=max(0, min(23, int(os.getenv("SESSION_START_HOUR", "7")))),
@@ -177,4 +236,25 @@ def load_settings() -> Settings:
         history_lookback_days=max(0, int(os.getenv("HISTORY_LOOKBACK_DAYS", "0"))),
         macd_era_start=os.getenv("MACD_ERA_START", "2026-09-03T00:00:00+00:00").strip()
         or "2026-09-03T00:00:00+00:00",
+        kronos_filter=os.getenv("KRONOS_FILTER", "false").strip().lower() in {"1", "true", "yes", "on"},
+        kronos_decisions_path=os.getenv("KRONOS_DECISIONS_PATH", "").strip(),
+        kronos_max_age_sec=max(60, int(os.getenv("KRONOS_MAX_AGE_SEC", "1800"))),
+        kronos_chop="skip" if os.getenv("KRONOS_CHOP", "allow").strip().lower() == "skip" else "allow",
+        max_lot_xau=max(0.01, float(os.getenv("MAX_LOT_XAU", "0.02"))),
+        news_blackout=os.getenv("NEWS_BLACKOUT", "true").strip().lower() not in {"0", "false", "no", "off"},
+        news_before_min=max(0, min(180, int(os.getenv("NEWS_BEFORE_MIN", "30")))),
+        news_after_min=max(0, min(180, int(os.getenv("NEWS_AFTER_MIN", "20")))),
+        news_pairs=parse_news_pairs(os.getenv("NEWS_PAIRS")),
+        atr_gate=os.getenv("ATR_GATE", "true").strip().lower() not in {"0", "false", "no", "off"},
+        monday_open_skip_min=max(0, min(180, int(os.getenv("MONDAY_OPEN_SKIP_MIN", "30")))),
+        strategy=parse_strategy(os.getenv("STRATEGY", "macd")),
+        day_range_mid_band_pct=max(
+            0.01,
+            min(0.25, float(os.getenv("DAY_RANGE_MID_BAND_PCT", "0.05"))),
+        ),
+        day_range_timeframe=(
+            "M5"
+            if os.getenv("DAY_RANGE_TIMEFRAME", "M15").strip().upper() == "M5"
+            else "M15"
+        ),
     )

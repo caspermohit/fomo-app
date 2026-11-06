@@ -13,10 +13,12 @@ MICRO_LOT = 0.01
 # Trend: close vs EMA200. Entry: default MACD 12/26/9 cross on the correct side of zero.
 # BUY: cross above signal, below zero, price above EMA200.
 # SELL: cross below signal, above zero, price below EMA200.
-# Stop beyond the pullback. Take 1.5R (the backtest clip). Not H1/H4, not ATR chop, not RSI.
+# Stop beyond the pullback (invalidation). Take 2R. Risk % is sized in the engine.
+# Real open gates (not display-only): H1+H4 agree, RSI exhaustion, ATR floor,
+# flat EMA200 skip, stretched-move skip.
 TAKE_ATR_MULT = 1.5  # kept for older tests / unused as primary SL
 STOP_ATR_MULT = 1.5
-REWARD_R = 1.5
+REWARD_R = 2.0
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
@@ -37,6 +39,12 @@ JPY_ATR_FLOOR = 8.0
 GOLD_ATR_FLOOR = 500.0
 RSI_OVERBOUGHT = 70.0
 RSI_OVERSOLD = 30.0
+# Flat EMA200: |ΔEMA200| over LOOKBACK M5 bars < FLAT_ATR_FRAC × ATR → skip (no trend).
+EMA_FLAT_LOOKBACK = 20
+EMA_FLAT_ATR_FRAC = 0.15
+# Stretched move: directional run on last 1–2 bars ≥ STRETCH_ATR_FRAC × ATR → late entry.
+STRETCH_BARS = 2
+STRETCH_ATR_FRAC = 0.70
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,15 @@ def min_atr_floor(symbol: str, configured: float = 1.0) -> float:
     else:
         pair_min = EUR_ATR_FLOOR
     return max(float(configured), pair_min)
+
+
+def skip_dead_tape(action: str, atr_pips: float, floor: float, enabled: bool = True) -> str | None:
+    """Engine overlay. MACD may still print BUY/SELL; quiet tape does not get a ticket."""
+    if not enabled or action not in {"BUY", "SELL"}:
+        return None
+    if float(atr_pips) + 1e-9 < float(floor):
+        return f"ATR {float(atr_pips):.1f} below floor {float(floor):.1f} — skip dead tape"
+    return None
 
 
 def pip_dollar_exits(
@@ -211,7 +228,7 @@ def closed_bars(bars: pd.DataFrame, now=None, tf_minutes: int = 5) -> pd.DataFra
 
 
 def htf_agrees(side: Signal, higher_tf=None, h1=None, h4=None) -> tuple[bool, str]:
-    """Display-only. The 100-trade article does not use H1/H4 as an entry gate."""
+    """Real entry gate: every provided H1/H4 bias must match the MACD side."""
     if side not in {"BUY", "SELL"}:
         return True, ""
     raw: list[tuple[str, str]] = []
@@ -238,7 +255,7 @@ def rsi_exhausted(side: Signal, rsi_now: float) -> str | None:
 
 
 def htf_bias(bars: pd.DataFrame) -> Signal:
-    """Higher-timeframe EMA21 direction. Shown on the desk; not an open gate."""
+    """Higher-timeframe EMA21 direction. Fed into htf_agrees as a real open gate."""
     if bars is None or len(bars) < 25 or "close" not in bars.columns:
         return "HOLD"
     close = bars["close"].astype(float)
@@ -275,6 +292,10 @@ def resample_ohlc(bars: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 def m5_to_h1(bars: pd.DataFrame) -> pd.DataFrame:
     return resample_ohlc(bars, "1h")
+
+
+def m5_to_m15(bars: pd.DataFrame) -> pd.DataFrame:
+    return resample_ohlc(bars, "15min")
 
 
 def m5_to_h4(bars: pd.DataFrame) -> pd.DataFrame:
@@ -350,6 +371,60 @@ def _bar_stamp(bars: pd.DataFrame) -> str:
     return ts.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+
+def ema200_flat(e200: pd.Series, atr_price: float, lookback: int = EMA_FLAT_LOOKBACK, frac: float = EMA_FLAT_ATR_FRAC) -> str | None:
+    """Skip when EMA200 slope is near-flat vs recent ATR (chop / no trend)."""
+    if e200 is None or len(e200) <= lookback or atr_price <= 0:
+        return None
+    now = float(e200.iloc[-1])
+    then = float(e200.iloc[-(lookback + 1)])
+    if pd.isna(now) or pd.isna(then):
+        return None
+    move = abs(now - then)
+    limit = float(frac) * float(atr_price)
+    if move + 1e-12 < limit:
+        return (
+            f"EMA200 flat over {lookback} bars "
+            f"(|Δ| {move:.6f} < {frac:.2f}×ATR {limit:.6f}) — skip"
+        )
+    return None
+
+
+def stretched_move(
+    bars: pd.DataFrame,
+    side: Signal,
+    atr_price: float,
+    n_bars: int = STRETCH_BARS,
+    frac: float = STRETCH_ATR_FRAC,
+) -> str | None:
+    """Skip late entries: signal candle / last 1–2 bars already ran a large ATR fraction.
+
+    Uses close-path distance (body / net close), not wick extremes — wicks are noise.
+    """
+    if side not in {"BUY", "SELL"} or bars is None or len(bars) < 1 or atr_price <= 0:
+        return None
+    n = max(1, min(int(n_bars), len(bars)))
+    window = bars.tail(n)
+    open0 = float(window["open"].iloc[0])
+    close1 = float(window["close"].iloc[-1])
+    last_open = float(window["open"].iloc[-1])
+    last_close = float(window["close"].iloc[-1])
+    if side == "BUY":
+        body = max(last_close - last_open, 0.0)
+        net = max(close1 - open0, 0.0)
+    else:
+        body = max(last_open - last_close, 0.0)
+        net = max(open0 - close1, 0.0)
+    run = max(body, net)
+    limit = float(frac) * float(atr_price)
+    if run + 1e-12 >= limit:
+        return (
+            f"stretched {side}: last {n} bar(s) already ran {run:.6f} "
+            f"(≥ {frac:.2f}×ATR {limit:.6f}) — skip late entry"
+        )
+    return None
+
+
 def analyze(
     bars: pd.DataFrame,
     symbol: str,
@@ -387,10 +462,10 @@ def analyze(
             spec = exits_from_pullback(position_volume, position_sl_pips, position_tp_pips / position_sl_pips if position_sl_pips else REWARD_R, **exit_kw)
             pnl_tag = f"${position_profit:+.2f}"
             if position_profit >= spec.take_usd:
-                return Analysis("CLOSE", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"take profit 1.5R: open P&L {pnl_tag}"], {"verdict": "bank"})
+                return Analysis("CLOSE", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"take profit {REWARD_R:g}R: open P&L {pnl_tag}"], {"verdict": "bank"})
             if position_profit <= -spec.cut_usd:
                 return Analysis("CLOSE", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"stop loss pullback: open P&L {pnl_tag}"], {"verdict": "cut"})
-            return Analysis("HOLD", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"hold {position_side}: open P&L {pnl_tag} — 1.5R vs pullback SL"], {"verdict": "hold"})
+            return Analysis("HOLD", "HOLD", 0, spec.sl_pips, spec.tp_pips, "unknown", 50.0, 20.0, [f"hold {position_side}: open P&L {pnl_tag} — {REWARD_R:g}R vs pullback SL"], {"verdict": "hold"})
         return empty
 
     close = frame["close"].astype(float)
@@ -426,7 +501,7 @@ def analyze(
             "in window" if in_session else "outside window"
         ),
         "candle": "bullish" if bullish else "bearish",
-        "tp": "1.5R",
+        "tp": f"{REWARD_R:g}R",
         "sl": "pullback",
         "htf": higher_tf or "n/a",
         "h1": htf_h1 or "n/a",
@@ -490,14 +565,14 @@ def analyze(
         if position_profit >= spec.take_usd:
             action = "CLOSE"
             checks["verdict"] = "bank"
-            reasons.insert(0, f"take profit 1.5R: open P&L {pnl_tag}")
+            reasons.insert(0, f"take profit {REWARD_R:g}R: open P&L {pnl_tag}")
         elif position_profit <= -spec.cut_usd:
             action = "CLOSE"
             checks["verdict"] = "cut"
             reasons.insert(0, f"stop loss pullback: open P&L {pnl_tag}")
         else:
             action = "HOLD"
-            reasons.insert(0, f"hold {position_side}: open P&L {pnl_tag} — 1.5R vs pullback SL")
+            reasons.insert(0, f"hold {position_side}: open P&L {pnl_tag} — {REWARD_R:g}R vs pullback SL")
         return Analysis(action, bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
     if not in_session:
@@ -525,12 +600,40 @@ def analyze(
         reasons.insert(0, "MACD SELL but close is not below EMA200")
         return Analysis("HOLD", "HOLD", confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
-    ok_htf, _htf_reason = htf_agrees(cross, higher_tf=higher_tf, h1=htf_h1, h4=htf_h4)
-    checks["htf_gate"] = "ok" if ok_htf else "ignored"
+    # ATR floor — block dead tape inside analyze (engine also overlays when ATR_GATE).
+    atr_price = atr * pip_size(symbol)
+    if atr + 1e-9 < need_atr:
+        checks["volatility"] = "low"
+        checks["atr_gate"] = "blocked"
+        reasons.insert(0, f"ATR {atr:.1f} below floor {need_atr:.1f} — skip dead tape")
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+    checks["atr_gate"] = "ok"
+
+    ok_htf, htf_reason = htf_agrees(cross, higher_tf=higher_tf, h1=htf_h1, h4=htf_h4)
+    checks["htf_gate"] = "ok" if ok_htf else "blocked"
+    if not ok_htf:
+        reasons.insert(0, htf_reason)
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+
     tired = rsi_exhausted(cross, rsi_now)
     checks["rsi_gate"] = "exhaustion" if tired else "ok"
+    if tired:
+        reasons.insert(0, tired)
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+
+    flat = ema200_flat(e200, atr_price)
+    checks["ema200_slope"] = "flat" if flat else "ok"
+    if flat:
+        reasons.insert(0, flat)
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
+
+    late = stretched_move(frame, cross, atr_price)
+    checks["stretch_gate"] = "blocked" if late else "ok"
+    if late:
+        reasons.insert(0, late)
+        return Analysis("HOLD", bias, confidence, sl, tp, trend, rsi_now, atr, reasons[:8], checks)
 
     spec = exits_from_pullback(position_volume, pullback_stop_pips(frame, symbol, cross, price, ema200), **exit_kw)
     sl, tp = spec.sl_pips, spec.tp_pips
-    reasons.insert(0, f"open {cross}: MACD cross + EMA200 (1.5R vs pullback SL)")
+    reasons.insert(0, f"open {cross}: MACD cross + EMA200 ({REWARD_R:g}R vs pullback SL)")
     return Analysis(cross, cross, 8, sl, tp, trend, rsi_now, atr, reasons[:8], checks)

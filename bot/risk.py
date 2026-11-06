@@ -109,7 +109,7 @@ def lot_for_budget(
 
 
 def session_drawdown_halt(session_pnl: float, max_session_loss: float, has_position: bool) -> Action | None:
-    """Account-level circuit breaker. None means the session may continue."""
+    """Daily loss halt (Kotegawa: ~2% of equity). None means the session may continue."""
     if session_pnl <= -abs(max_session_loss):
         return "CLOSE" if has_position else "HOLD"
     return None

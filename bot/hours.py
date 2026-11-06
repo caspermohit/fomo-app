@@ -25,3 +25,17 @@ def fx_weekend(ts: datetime | None = None) -> bool:
     if weekday == 6 and hour < 21:
         return True
     return False
+
+
+def fx_monday_open(ts: datetime | None = None, skip_minutes: int = 30) -> bool:
+    """True for the first N minutes after Sunday 21:00 UTC (FX reopen / thin book)."""
+    wait = int(skip_minutes or 0)
+    if wait <= 0:
+        return False
+    utc = _utc(ts)
+    if utc.weekday() != 6:
+        return False
+    reopen = utc.replace(hour=21, minute=0, second=0, microsecond=0)
+    if utc < reopen:
+        return False
+    return (utc - reopen).total_seconds() < wait * 60

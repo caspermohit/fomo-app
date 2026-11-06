@@ -12,7 +12,14 @@ const uiHost = (() => {
 })();
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ["127.0.0.1", "localhost", ...(uiHost ? [uiHost] : [])],
+  allowedDevOrigins: [
+    "127.0.0.1",
+    "localhost",
+    "100.116.239.1",
+    "192.168.0.109",
+    "casperserver.tail698d43.ts.net",
+    ...(uiHost ? [uiHost] : []),
+  ],
   async rewrites() {
     return [
       {

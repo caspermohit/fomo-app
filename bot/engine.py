@@ -7,9 +7,14 @@ from collections import deque
 from datetime import datetime, timezone
 
 from bot.broker import AccountSnapshot, Broker
-from bot.analyst import analyze, m5_to_h1, m5_to_h4, multi_tf_bias
+from bot.analyst import REWARD_R, analyze, m5_to_h1, m5_to_h4, m5_to_m15, multi_tf_bias, skip_dead_tape
+from bot.day_range import analyze_day_range
+from bot.vwap_ema import analyze_vwap_ema
+from bot.htf_sweep import desk_report, empty_report, evaluate_htf
+from bot.kronos_filter import kronos_allows, load_decisions, symbol_status
 from bot.config import BILL_PAIRS, STATE_PATH, Settings, load_settings
-from bot.hours import fx_weekend
+from bot.hours import fx_monday_open, fx_weekend
+from bot.news_calendar import blackout_for, news_snapshot
 from bot.mt5_broker import MT5Broker
 from bot.mutex import leftover_ea, python_heartbeat, python_release, status as mutex_status
 from bot.wine_ipc import looks_dead, recover as recover_wine_ipc
@@ -43,6 +48,55 @@ def _parse_close_ts(trade: dict) -> float:
         return dt.timestamp()
     except ValueError:
         return 0.0
+
+
+def merge_trade_rows(*groups: list[dict]) -> list[dict]:
+    """Dedupe by ticket, newest close first. Empty tickets are kept."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for group in groups:
+        for row in group or []:
+            tid = str(row.get("ticket") or "")
+            if tid and tid in seen:
+                continue
+            if tid:
+                seen.add(tid)
+            out.append(dict(row))
+    out.sort(key=lambda t: (_parse_close_ts(t), str(t.get("time") or "")), reverse=True)
+    return out
+
+
+def _closed_dict(t, *, venue: str | None = None) -> dict:
+    row = {
+        "time": t.time,
+        "utc_day": getattr(t, "utc_day", "") or str(t.time)[:10],
+        "symbol": t.symbol,
+        "side": t.side,
+        "volume": t.volume,
+        "price": t.price,
+        "profit": t.profit,
+        "ticket": t.ticket,
+        "magic": getattr(t, "magic", None),
+        "comment": getattr(t, "comment", "") or "",
+    }
+    if venue:
+        row["venue"] = venue
+    return row
+
+
+def _position_dict(p, *, venue: str | None = None) -> dict:
+    row = {
+        "symbol": p.symbol,
+        "side": p.side,
+        "volume": p.volume,
+        "price": p.price,
+        "profit": p.profit,
+        "ticket": p.ticket,
+        "magic": getattr(p, "magic", None),
+    }
+    if venue:
+        row["venue"] = venue
+    return row
 
 
 def _macd_era_ts(settings: Settings) -> float:
@@ -127,8 +181,6 @@ class BotEngine:
         self.last_bid = None
         self.last_ask = None
         self.max_positions = int(self.settings.max_positions)
-        self.profit_arm_usd = float(self.settings.profit_arm_usd)
-        self.profit_giveback_pct = float(self.settings.profit_giveback_pct)
         self.fill_venue = "paper" if self.settings.fill_venue != "mt5" else "mt5"
         self.feed: Broker | None = None
         self.mt5_status = self._blank_mt5("not attached yet")
@@ -147,6 +199,9 @@ class BotEngine:
         self._usd_jpy_cache: tuple[float, float] | None = None
         self._pip_value_cache: dict[str, tuple[float, float]] = {}
         self._macd_by_symbol: dict[str, dict] = {}
+        self._closed_cache: list[dict] = []
+        self._closed_cache_at = 0.0
+        self._closed_cache_nrec = 0
 
     def _pairs(self) -> tuple[str, ...]:
         return self.settings.pairs
@@ -171,6 +226,10 @@ class BotEngine:
                 "signal": "HOLD",
                 "price": None,
                 "last_cross_bar": "",
+                "daily_bars": None,
+                "day_range_tf": "M15",
+                "htf_report": desk_report(),
+                "htf_report_ts": 0.0,
             }
             self._books[symbol] = slot
         return slot
@@ -201,15 +260,21 @@ class BotEngine:
     def _tf_frame(self, timeframe: str, m5_bars=None, count: int = 80, symbol: str | None = None):
         pair = symbol or self.focus_symbol
         market = self._market()
+        min_ok = 10 if timeframe == "M15" else 25
         if market is not None:
             try:
                 frame = market.bars(pair, count, timeframe=timeframe)
-                if frame is not None and len(frame) >= 25:
+                if frame is not None and len(frame) >= min_ok:
                     return frame
             except Exception:
                 pass
         src = m5_bars
-        need = 1200 if timeframe == "H4" else 400
+        if timeframe == "H4":
+            need = 1200
+        elif timeframe == "M15":
+            need = max(400, int(count) * 4)
+        else:
+            need = 400
         if src is None or len(src) < 60:
             src = None
             if market is not None:
@@ -219,7 +284,37 @@ class BotEngine:
                     src = None
         if src is None:
             return None
-        return m5_to_h4(src) if timeframe == "H4" else m5_to_h1(src)
+        if timeframe == "H4":
+            return m5_to_h4(src)
+        if timeframe == "M15":
+            return m5_to_m15(src)
+        return m5_to_h1(src)
+
+    def _refresh_htf_report(self, symbol: str, m5_bars=None, *, force: bool = False) -> dict:
+        """H1 → M15 → M5 sweep report. Advisory only unless the desk sends it."""
+        book = self._book(symbol)
+        now = time.time()
+        cached = book.get("htf_report")
+        if not force and cached and now - float(book.get("htf_report_ts") or 0) <= 15:
+            return cached
+        h1 = self._tf_frame("H1", m5_bars, count=80, symbol=symbol)
+        m15 = self._tf_frame("M15", m5_bars, count=80, symbol=symbol)
+        m5 = m5_bars
+        if m5 is None:
+            market = self._market()
+            if market is not None:
+                try:
+                    m5 = market.bars(symbol, 250, timeframe="M5")
+                except Exception:
+                    m5 = None
+        try:
+            raw = evaluate_htf(h1, m15, m5, symbol, now=datetime.now(timezone.utc))
+        except Exception:
+            raw = empty_report("H1 / M15 / M5 report unavailable")
+        report = desk_report(raw)
+        book["htf_report"] = report
+        book["htf_report_ts"] = now
+        return report
 
     def _spread_pips(self, symbol: str | None = None) -> float | None:
         pair = symbol or self.focus_symbol
@@ -331,28 +426,60 @@ class BotEngine:
         self._pip_value_cache[symbol] = (now, val)
         return val
 
+    def _strategy(self) -> str:
+        from bot.config import parse_strategy
+
+        return parse_strategy(getattr(self.settings, "strategy", "macd"))
+
     def _analyze(self, bars, **kwargs):
         pair = kwargs.pop("symbol", None) or self.focus_symbol
-        kwargs.setdefault("higher_tf", self._higher_tf(bars, symbol=pair))
-        book = self._book(pair)
-        kwargs.setdefault("htf_h1", book.get("h1"))
-        kwargs.setdefault("htf_h4", book.get("h4"))
         kwargs.setdefault("now", datetime.now(timezone.utc))
         kwargs.setdefault("spread_pips", self._spread_pips(pair))
         kwargs.setdefault("max_spread_pips", self.settings.spread_cap(pair))
         kwargs.setdefault("usd_jpy", self._usd_jpy())
         kwargs.setdefault("pip_value", self._pip_value(pair))
-        return analyze(
-            bars,
-            pair,
+        session = dict(
             session_start_hour=self.settings.session_start_hour,
             session_end_hour=self.settings.session_end_hour,
             session_start_minute=self.settings.session_start_minute,
             session_end_minute=self.settings.session_end_minute,
+        )
+        if self._strategy() == "day_range":
+            daily = kwargs.pop("daily", None)
+            if daily is None:
+                book = self._book(pair)
+                daily = book.get("daily_bars")
+            tf = str(getattr(self.settings, "day_range_timeframe", "M15") or "M15")
+            return analyze_day_range(
+                bars,
+                daily,
+                pair,
+                mid_band_pct=float(getattr(self.settings, "day_range_mid_band_pct", 0.05) or 0.05),
+                timeframe=tf,
+                **session,
+                **kwargs,
+            )
+        if self._strategy() == "vwap_ema":
+            return analyze_vwap_ema(
+                bars,
+                pair,
+                min_atr_pips=self.settings.atr_floor(pair),
+                atr_gate=bool(getattr(self.settings, "atr_gate", True)),
+                **session,
+                **kwargs,
+            )
+        kwargs.setdefault("higher_tf", self._higher_tf(bars, symbol=pair))
+        book = self._book(pair)
+        kwargs.setdefault("htf_h1", book.get("h1"))
+        kwargs.setdefault("htf_h4", book.get("h4"))
+        return analyze(
+            bars,
+            pair,
             min_atr_pips=self.settings.atr_floor(pair),
             min_score=self.settings.min_score,
             take_atr_mult=self.settings.take_atr_mult,
             stop_atr_mult=self.settings.stop_atr_mult,
+            **session,
             **kwargs,
         )
 
@@ -374,16 +501,17 @@ class BotEngine:
             self._bankroll(),
             self.settings.risk_pct,
             sl,
-            self.settings.max_lot,
+            self.settings.lot_cap(pair),
             symbol=pair,
             pip_value=self._pip_value(pair),
         )
 
     def _history_since_ts(self) -> int:
         days = int(getattr(self.settings, "history_lookback_days", 0) or 0)
-        if days <= 0:
-            return 0
-        return int(time.time()) - days * 86400
+        if days > 0:
+            return int(time.time()) - days * 86400
+        # MT5 treats unix 0 as "unset" and often returns only the History tab window.
+        return int(datetime(2018, 1, 1, tzinfo=timezone.utc).timestamp())
 
     def log(self, message: str) -> None:
         line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S')}  {message}"
@@ -408,42 +536,53 @@ class BotEngine:
                 pass
             try:
                 positions = []
+                fill_venue = "paper" if self.broker_name.startswith("paper") else "mt5"
                 for pair in self._pairs():
                     positions.extend(
-                        {
-                            "symbol": p.symbol,
-                            "side": p.side,
-                            "volume": p.volume,
-                            "price": p.price,
-                            "profit": p.profit,
-                            "ticket": p.ticket,
-                            "magic": getattr(p, "magic", None),
-                        }
+                        _position_dict(p, venue=fill_venue)
                         for p in self.broker.positions(pair)
                     )
+                if self.feed and self.feed is not self.broker:
+                    mt5_pos = []
+                    for pair in self._pairs():
+                        mt5_pos.extend(
+                            _position_dict(p, venue="mt5")
+                            for p in self.feed.positions(pair)
+                        )
+                    positions = merge_trade_rows(mt5_pos, positions)
                 positions = self._annotate_positions(positions)
             except Exception:
                 positions = []
             try:
-                closed = [
-                    {
-                        "time": t.time,
-                        "utc_day": getattr(t, "utc_day", "") or str(t.time)[:10],
-                        "symbol": t.symbol,
-                        "side": t.side,
-                        "volume": t.volume,
-                        "price": t.price,
-                        "profit": t.profit,
-                        "ticket": t.ticket,
-                        "magic": getattr(t, "magic", None),
-                        "comment": getattr(t, "comment", "") or "",
-                    }
-                    for t in self.broker.closed_trades(self._history_since_ts())
-                ]
+                now_m = time.monotonic()
+                nrec = len(self.recorded_closes)
+                if (
+                    self._closed_cache
+                    and now_m - self._closed_cache_at < 2
+                    and nrec == self._closed_cache_nrec
+                ):
+                    closed = self._closed_cache
+                else:
+                    fill_tag = "paper" if self.broker_name.startswith("paper") else "mt5"
+                    closed = [
+                        _closed_dict(t, venue=fill_tag)
+                        for t in self.broker.closed_trades(self._history_since_ts())
+                    ]
+                    if self.feed and self.feed is not self.broker:
+                        try:
+                            mt5_closed = [
+                                _closed_dict(t, venue="mt5")
+                                for t in self.feed.closed_trades(self._history_since_ts())
+                            ]
+                            closed = merge_trade_rows(mt5_closed, closed)
+                        except Exception:
+                            pass
+                    self._closed_cache = closed
+                    self._closed_cache_at = now_m
+                    self._closed_cache_nrec = nrec
             except Exception:
-                closed = []
-        if not closed and self.recorded_closes:
-            closed = list(reversed(self.recorded_closes[-2000:]))
+                closed = list(self._closed_cache)
+        closed = merge_trade_rows(self._with_recorded_closes(closed))
         market = self._market()
         if market:
             for pair in self._pairs():
@@ -551,7 +690,7 @@ class BotEngine:
             "pnl": pnl,
             "closed_trades": closed,
             "positions": positions,
-            "bars": self.last_bars[-80:],
+            "bars": self.last_bars[-250:],
             "bid": self.last_bid,
             "ask": self.last_ask,
             "fills": fills,
@@ -569,8 +708,8 @@ class BotEngine:
             "open_count": len(positions),
             "max_positions": self.max_positions,
             "max_positions_total": self.max_positions,
-            "profit_arm_usd": self.profit_arm_usd,
-            "profit_giveback_pct": self.profit_giveback_pct,
+            "daily_loss_pct": float(self.settings.daily_loss_pct),
+            "reward_r": float(REWARD_R),
             "poll_seconds": self.settings.poll_seconds,
             "min_atr_pips": self.settings.atr_floor(self.focus_symbol),
             "min_atr_pips_xau": self.settings.min_atr_pips_xau,
@@ -583,15 +722,20 @@ class BotEngine:
             "min_score": self.settings.min_score,
             "take_atr_mult": self.settings.take_atr_mult,
             "stop_atr_mult": self.settings.stop_atr_mult,
-            "strategy": "macd",
+            "strategy": self._strategy(),
             "min_entry_seconds": self.settings.min_entry_seconds,
             "htf": (focus_book.get("analysis") or {}).get("checks", {}).get("htf") if isinstance((focus_book.get("analysis") or {}).get("checks"), dict) else None,
             "h1": focus_book.get("h1"),
             "h4": focus_book.get("h4"),
+            "htf_report": focus_book.get("htf_report") or desk_report(),
             "max_spread_pips": self.settings.spread_cap(self.focus_symbol),
             "max_spread_pips_jpy": self.settings.max_spread_pips_jpy,
             "mutex": self._mutex_status(),
             "blockers": self._blockers(self.focus_symbol),
+            "news": self._news_public(),
+            "atr_gate": bool(getattr(self.settings, "atr_gate", True)),
+            "news_blackout": bool(getattr(self.settings, "news_blackout", True)),
+            "monday_open_skip_min": int(getattr(self.settings, "monday_open_skip_min", 30) or 0),
             "logs": list(self.logs),
             "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
@@ -719,28 +863,6 @@ class BotEngine:
             return int(magic or 0) == int(self.settings.magic)
         return str(getattr(position, "ticket", "")) in {str(k) for k in self._exits_by_ticket}
 
-    def _apply_profit_lock(self, positions) -> list:
-        remaining = []
-        for pos in positions:
-            ticket = str(pos.ticket)
-            profit = float(pos.profit)
-            if self._is_bot_position(pos):
-                peak = max(float(self.peak_by_ticket.get(ticket, profit)), profit)
-                self.peak_by_ticket[ticket] = peak
-                armed = peak >= self.profit_arm_usd
-                giveback = armed and profit <= peak * (1.0 - self.profit_giveback_pct)
-                if giveback:
-                    result = self.broker.close_one(pos.symbol, pos.ticket)
-                    if result.ok:
-                        self.log(f"{pos.symbol} ticket={pos.ticket} profit peak giveback {profit:+.2f} from {peak:+.2f}: {result.message}")
-                        self._note_closes([pos])
-                        self.peak_by_ticket.pop(ticket, None)
-                        self._exits_by_ticket.pop(ticket, None)
-                        continue
-                    self.log(f"{pos.symbol} ticket={pos.ticket} profit giveback close failed: {result.message}")
-            remaining.append(pos)
-        return remaining
-
     def step(self) -> None:
         assert self.broker is not None
         market = self._market()
@@ -756,23 +878,21 @@ class BotEngine:
             self._publish_focus()
             return
 
-        all_pos = self._apply_profit_lock(all_pos)
-
         halt = session_drawdown_halt(
             self.session_pnl,
-            self._bankroll() * 0.20,
+            self._bankroll() * float(self.settings.daily_loss_pct),
             bool(all_pos),
         )
         if halt == "CLOSE":
             for pair in pairs:
                 before = self.broker.positions(pair)
                 result = self.broker.close_all(pair)
-                self.log(f"{result.message} (session loss stop)")
+                self.log(f"{result.message} (daily loss stop {self.settings.daily_loss_pct:.0%})")
                 self._note_closes(before)
             return
         if halt == "HOLD":
             for pair in pairs:
-                self._book(pair)["reason"] = "session loss stop"
+                self._book(pair)["reason"] = "daily loss stop"
             self._publish_focus()
             return
 
@@ -796,8 +916,30 @@ class BotEngine:
         market = self._market()
         assert market is not None
         book = self._book(symbol)
-        bars = market.bars(symbol, 250)
-        self._cache_market(bars, symbol)
+        if self._strategy() == "day_range":
+            tf = str(getattr(self.settings, "day_range_timeframe", "M15") or "M15")
+            try:
+                bars = market.bars(symbol, 120, timeframe=tf)
+            except Exception:
+                # Broker may lack M15; fall back to M5 for the same sweep rules.
+                bars = market.bars(symbol, 250, timeframe="M5")
+                tf = "M5"
+            book["day_range_tf"] = tf
+            try:
+                daily = market.bars(symbol, 10, timeframe="D1")
+            except Exception:
+                daily = None
+            book["daily_bars"] = daily
+            self._cache_market(bars, symbol)
+            try:
+                m5_for_report = market.bars(symbol, 250, timeframe="M5")
+            except Exception:
+                m5_for_report = bars
+        else:
+            bars = market.bars(symbol, 250)
+            self._cache_market(bars, symbol)
+            m5_for_report = bars
+        self._refresh_htf_report(symbol, m5_for_report)
         positions = self.broker.positions(symbol)
         verdict = self._analyze(bars, open_count=len(positions), symbol=symbol)
         book["analysis"] = verdict.as_dict()
@@ -843,6 +985,11 @@ class BotEngine:
             book["reason"] = f"{symbol} MACD pace — next ticket in {left}s"
             return
 
+        skip_m = int(getattr(self.settings, "monday_open_skip_min", 30) or 0)
+        if fx_monday_open(skip_minutes=skip_m):
+            book["reason"] = f"{symbol} Monday open — skip {skip_m}m after Sunday 21:00 UTC"
+            return
+
         entry = self._analyze(bars, open_count=len(still_open), symbol=symbol)
         book["analysis"] = entry.as_dict()
         book["signal"] = entry.bias
@@ -867,14 +1014,60 @@ class BotEngine:
         if isinstance(entry.checks, dict):
             cross_bar = str(entry.checks.get("cross_bar") or "")
         if cross_bar and book.get("last_cross_bar") == cross_bar:
-            book["reason"] = f"{symbol} already used MACD cross on {cross_bar}"
+            book["reason"] = f"{symbol} already used setup bar {cross_bar}"
             return
+
+        news_hit = self._news_hit(symbol)
+        if news_hit and entry.action in {"BUY", "SELL"}:
+            why = str(news_hit.get("reason") or f"{symbol} news blackout")
+            book["reason"] = why
+            key = (str(news_hit.get("name") or ""), why)
+            if book.get("_news_log") != key:
+                book["_news_log"] = key
+                self.log(why)
+            return
+
+        if self._strategy() in {"macd", "vwap_ema"}:
+            tape = skip_dead_tape(
+                entry.action,
+                float(entry.atr_pips),
+                float(self.settings.atr_floor(symbol)),
+                bool(getattr(self.settings, "atr_gate", True)),
+            )
+            if tape:
+                book["reason"] = f"{symbol} {tape}"
+                return
+
+        if (
+            entry.action in {"BUY", "SELL"}
+            and self._strategy() == "macd"
+            and bool(getattr(self.settings, "kronos_filter", False))
+        ):
+            ok, why, kchecks = kronos_allows(
+                symbol,
+                entry.action,
+                enabled=True,
+                path=getattr(self.settings, "kronos_decisions_path", None) or None,
+                max_age_sec=float(getattr(self.settings, "kronos_max_age_sec", 1800) or 1800),
+                chop_policy=str(getattr(self.settings, "kronos_chop", "allow") or "allow"),
+            )
+            if isinstance(entry.checks, dict):
+                entry.checks.update(kchecks)
+                book["analysis"] = entry.as_dict()
+            if not ok:
+                book["reason"] = why
+                book["signal"] = entry.bias
+                key = (cross_bar, why)
+                if book.get("_kronos_log") != key:
+                    book["_kronos_log"] = key
+                    self.log(why)
+                return
 
         lot = lot_for_budget(
             self._bankroll(),
             self.settings.risk_pct,
             entry.sl_pips,
-            self.settings.max_lot,
+            self.settings.lot_cap(symbol),
             symbol=symbol,
             pip_value=self._pip_value(symbol),
         )
@@ -940,9 +1133,16 @@ class BotEngine:
         pair = symbol or self.focus_symbol
         if bars is None or bars.empty:
             return
-        tail = bars.tail(80)
+        tail = bars.tail(250)
         rows = []
         for rec in tail.to_dict("records"):
+            # "v" is tick volume, kept so the Kronos refresher can build CSVs from this
+            # cache instead of opening a second MT5 connection alongside the live bot.
+            vol = rec.get("tick_volume", rec.get("volume"))
+            try:
+                vol = float(vol)
+            except (TypeError, ValueError):
+                vol = 0.0
             rows.append(
                 {
                     "t": str(rec.get("time", "")),
@@ -950,6 +1150,7 @@ class BotEngine:
                     "h": float(rec["high"]),
                     "l": float(rec["low"]),
                     "c": float(rec["close"]),
+                    "v": vol,
                 }
             )
         book = self._book(pair)
@@ -969,6 +1170,10 @@ class BotEngine:
 
     def _books_public(self) -> dict:
         out = {}
+        k_enabled = bool(getattr(self.settings, "kronos_filter", False))
+        k_path = getattr(self.settings, "kronos_decisions_path", None) or None
+        k_age = float(getattr(self.settings, "kronos_max_age_sec", 1800) or 1800)
+        k_payload = load_decisions(k_path)
         for pair in self._pairs():
             book = self._book(pair)
             spread = None
@@ -994,7 +1199,7 @@ class BotEngine:
                 "last_price": book.get("price"),
                 "last_reason": book.get("reason"),
                 "last_signal": book.get("signal"),
-                "bars": (book.get("bars") or [])[-80:],
+                "bars": (book.get("bars") or [])[-250:],
                 "open_count": open_n,
                 "blockers": self._blockers(pair),
                 "max_spread_pips": self.settings.spread_cap(pair),
@@ -1004,8 +1209,35 @@ class BotEngine:
                 "macd_wins": pair_macd.get("macd_wins", 0),
                 "macd_win_rate": pair_macd.get("macd_win_rate"),
                 "macd_net": pair_macd.get("macd_net"),
+                "kronos": symbol_status(
+                    pair,
+                    enabled=k_enabled,
+                    path=k_path,
+                    max_age_sec=k_age,
+                    payload=k_payload,
+                    chop_policy=str(getattr(self.settings, "kronos_chop", "allow") or "allow"),
+                ),
+                "news": self._news_hit(pair),
+                "htf_report": book.get("htf_report") or desk_report(),
             }
         return out
+
+    def _with_recorded_closes(self, closed: list[dict]) -> list[dict]:
+        """Keep this-session closes on top even if MT5 history is lagging."""
+        if not self.recorded_closes:
+            return closed
+        seen = {str(t.get("ticket") or "") for t in closed if t.get("ticket")}
+        extra = []
+        for row in reversed(self.recorded_closes):
+            tid = str(row.get("ticket") or "")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            extra.append(dict(row))
+        if not extra:
+            return closed
+        extra.sort(key=lambda t: str(t.get("time") or ""), reverse=True)
+        return extra + list(closed)
 
     def _note_closes(self, positions) -> None:
         now = datetime.now(timezone.utc)
@@ -1155,6 +1387,24 @@ class BotEngine:
             self.log(f"MT5 retry failed: {exc}")
             return {"ok": False, "message": str(exc)}
 
+    def _news_hit(self, symbol: str) -> dict | None:
+        return blackout_for(
+            symbol,
+            enabled=bool(getattr(self.settings, "news_blackout", True)),
+            before_min=int(getattr(self.settings, "news_before_min", 30) or 0),
+            after_min=int(getattr(self.settings, "news_after_min", 20) or 0),
+            pairs=tuple(getattr(self.settings, "news_pairs", ("XAUUSD",)) or ()),
+        )
+
+    def _news_public(self) -> dict:
+        return news_snapshot(
+            self._pairs(),
+            enabled=bool(getattr(self.settings, "news_blackout", True)),
+            before_min=int(getattr(self.settings, "news_before_min", 30) or 0),
+            after_min=int(getattr(self.settings, "news_after_min", 20) or 0),
+            pairs=tuple(getattr(self.settings, "news_pairs", ("XAUUSD",)) or ()),
+        )
+
     def _blockers(self, symbol: str | None = None) -> list[str]:
         pair = symbol or self.focus_symbol
         out: list[str] = []
@@ -1182,6 +1432,20 @@ class BotEngine:
             out.append(f"{pair}: {a['reasons'][0]}")
         if self.settings.weekend_guard and fx_weekend():
             out.append("FX weekend — no new tickets (Fri 21:00–Sun 21:00 UTC)")
+        skip_m = int(getattr(self.settings, "monday_open_skip_min", 30) or 0)
+        if fx_monday_open(skip_minutes=skip_m):
+            out.append(f"{pair} Monday open — skip {skip_m}m after Sunday 21:00 UTC")
+        news_hit = self._news_hit(pair)
+        if news_hit:
+            out.append(str(news_hit.get("reason") or f"{pair} news blackout"))
+        tape = skip_dead_tape(
+            str(a.get("action") or ""),
+            float(a.get("atr_pips") or 0),
+            float(self.settings.atr_floor(pair)),
+            bool(getattr(self.settings, "atr_gate", True)),
+        )
+        if tape:
+            out.append(f"{pair} {tape}")
         if time.time() < float(book.get("blocked_until") or 0):
             left = int(book["blocked_until"] - time.time())
             out.append(f"{pair} cooldown after stop-out ({left}s left)")
@@ -1191,10 +1455,10 @@ class BotEngine:
         mutex = self._mutex_status()
         if leftover_ea() or mutex.get("ea_active") or mutex.get("leftover_ea"):
             out.append("old trading EA still on the chart — Refresh Navigator; Python is the only bot")
-        return out[:8]
+        return out[:12]
 
     def set_max_positions(self, n: int) -> dict:
-        self.max_positions = max(1, min(2, int(n)))
+        self.max_positions = max(1, min(4, int(n)))
         self.log(f"UI set max open tickets total to {self.max_positions}")
         self.persist()
         return {"ok": True, "max_positions": self.max_positions, "message": f"max tickets {self.max_positions} total"}
@@ -1305,7 +1569,7 @@ class BotEngine:
             blocked = can_add_position(
                 spots,
                 side,
-                self.max_positions,
+                1,
                 require_pyramid_winners=True,
             )
             if blocked:
@@ -1317,7 +1581,7 @@ class BotEngine:
                 self._bankroll(),
                 self.settings.risk_pct,
                 sl,
-                self.settings.max_lot,
+                self.settings.lot_cap(pair),
                 symbol=pair,
                 pip_value=self._pip_value(pair),
             )
@@ -1331,6 +1595,77 @@ class BotEngine:
             self.log(f"UI {side} {result.message}")
             self.persist()
             return {"ok": result.ok, "message": result.message, "ticket": result.ticket}
+
+    def take_htf_report(self, symbol: str | None = None) -> dict:
+        """Place the report's BUY/SELL only when H1 + M15 + M5 agree. Demo only."""
+        if not self.running:
+            return {"ok": False, "message": "bot is stopped — press START"}
+        if not self.broker:
+            return {"ok": False, "message": "broker offline"}
+        pair = self._resolve_pair(symbol)
+        with self._lock:
+            mutex_block = self._sync_mutex()
+            if mutex_block:
+                return {"ok": False, "message": mutex_block}
+            if self.settings.weekend_guard and fx_weekend():
+                return {"ok": False, "message": "FX weekend — no new tickets"}
+            news_hit = self._news_hit(pair)
+            if news_hit:
+                return {"ok": False, "message": str(news_hit.get("reason") or f"{pair} news blackout")}
+            book = self._book(pair)
+            m5 = None
+            market = self._market()
+            if market is not None:
+                try:
+                    m5 = market.bars(pair, 250, timeframe="M5")
+                except Exception:
+                    m5 = None
+            report = self._refresh_htf_report(pair, m5, force=True)
+            if not report.get("ready") or report.get("action") not in {"BUY", "SELL"}:
+                why = str(report.get("why") or "report is not ready")
+                return {"ok": False, "message": why, "htf_report": report}
+            side = str(report["action"])
+            cross_bar = str(report.get("cross_bar") or "")
+            if cross_bar and book.get("last_cross_bar") == cross_bar:
+                return {"ok": False, "message": f"{pair} already used setup bar {cross_bar}", "htf_report": report}
+            spots = self._current_positions(pair)
+            if len(self._all_positions()) >= self.max_positions:
+                return {"ok": False, "message": f"already {self.max_positions}/{self.max_positions} total open trades"}
+            blocked = can_add_position(
+                spots,
+                side,
+                1,
+                require_pyramid_winners=True,
+            )
+            if blocked:
+                return {"ok": False, "message": f"{pair} {blocked}"}
+            sl = float(report.get("sl_pips") or self.settings.sl_pips)
+            tp = float(report.get("tp_pips") or self.settings.tp_pips)
+            lot = lot_for_budget(
+                self._bankroll(),
+                self.settings.risk_pct,
+                sl,
+                self.settings.lot_cap(pair),
+                symbol=pair,
+                pip_value=self._pip_value(pair),
+            )
+            result = (
+                self.broker.buy(pair, lot, sl, tp)
+                if side == "BUY"
+                else self.broker.sell(pair, lot, sl, tp)
+            )
+            if result.ok and result.ticket:
+                self._exits_by_ticket[result.ticket] = (sl, tp)
+                if cross_bar:
+                    book["last_cross_bar"] = cross_bar
+            self.log(f"UI REPORT {side} {pair} {result.message}")
+            self.persist()
+            return {
+                "ok": result.ok,
+                "message": result.message,
+                "ticket": result.ticket,
+                "htf_report": report,
+            }
 
     def manual_buy(self, symbol: str | None = None) -> dict:
         return self._manual_fill("BUY", symbol)

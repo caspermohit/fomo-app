@@ -145,11 +145,11 @@ def test_exits_are_atr_multiples_not_percent_of_price():
     assert abs(spec.cut_usd - 2.25) < 1e-9
 
 
-def test_pullback_exits_are_one_point_five_r():
+def test_pullback_exits_are_two_r():
     spec = exits_from_pullback(0.10, sl_pips=10.0)
     assert abs(spec.sl_pips - 10.0) < 1e-9
-    assert abs(spec.tp_pips - 15.0) < 1e-9
-    assert abs(spec.take_usd - 15.0) < 1e-9
+    assert abs(spec.tp_pips - 20.0) < 1e-9
+    assert abs(spec.take_usd - 20.0) < 1e-9
     assert abs(spec.cut_usd - 10.0) < 1e-9
 
 
@@ -321,7 +321,7 @@ def test_macd_buys_cross_below_zero_above_ema200():
     assert a.action == "BUY"
     assert a.checks["ema200"] == "above"
     assert a.checks["zero"] == "below"
-    assert abs(a.tp_pips / a.sl_pips - 1.5) < 1e-9
+    assert abs(a.tp_pips / a.sl_pips - 2.0) < 1e-9
 
 
 def test_macd_sells_cross_above_zero_below_ema200():
@@ -329,7 +329,7 @@ def test_macd_sells_cross_above_zero_below_ema200():
     assert a.action == "SELL"
     assert a.checks["ema200"] == "below"
     assert a.checks["zero"] == "above"
-    assert abs(a.tp_pips / a.sl_pips - 1.5) < 1e-9
+    assert abs(a.tp_pips / a.sl_pips - 2.0) < 1e-9
 
 
 def test_macd_blocks_wide_spread():
@@ -354,36 +354,41 @@ def test_multi_tf_bias_requires_agreement():
     assert combined == "HOLD"
 
 
-def test_htf_disagree_does_not_block_macd():
+def test_htf_disagree_blocks_macd():
     bars = _ohlc(_buy_macd_closes())
     open_ok = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="BUY", htf_h4="BUY")
     assert open_ok.action == "BUY"
     disagree = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="BUY", htf_h4="SELL")
-    assert disagree.action == "BUY"
-    assert disagree.checks.get("htf_gate") == "ignored"
+    assert disagree.action == "HOLD"
+    assert disagree.checks.get("htf_gate") == "blocked"
+    assert "htf" in " ".join(disagree.reasons).lower()
+    open_ok_gate = open_ok.checks.get("htf_gate")
+    assert open_ok_gate == "ok"
     hold = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="HOLD", htf_h4="BUY")
-    assert hold.action == "BUY"
-    assert hold.checks.get("htf_gate") == "ignored"
+    assert hold.action == "HOLD"
+    assert hold.checks.get("htf_gate") == "blocked"
 
 
-def test_rsi_exhaustion_does_not_block_macd(monkeypatch):
+def test_rsi_exhaustion_blocks_macd(monkeypatch):
     bars = _ohlc(_buy_macd_closes())
     monkeypatch.setattr(
         "bot.analyst.rsi",
         lambda close, period=14: pd.Series([72.0] * len(close)),
     )
-    tired_buy = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16)
-    assert tired_buy.action == "BUY"
+    tired_buy = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="BUY", htf_h4="BUY")
+    assert tired_buy.action == "HOLD"
     assert tired_buy.checks.get("rsi_gate") == "exhaustion"
+    assert "rsi" in " ".join(tired_buy.reasons).lower()
 
     sell_bars = _ohlc(_sell_macd_closes())
     monkeypatch.setattr(
         "bot.analyst.rsi",
         lambda close, period=14: pd.Series([25.0] * len(close)),
     )
-    tired_sell = analyze(sell_bars, "EURUSD", session_start_hour=7, session_end_hour=16)
-    assert tired_sell.action == "SELL"
+    tired_sell = analyze(sell_bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="SELL", htf_h4="SELL")
+    assert tired_sell.action == "HOLD"
     assert tired_sell.checks.get("rsi_gate") == "exhaustion"
+    assert "rsi" in " ".join(tired_sell.reasons).lower()
 
 
 def test_macd_respects_london_hours():
@@ -592,7 +597,7 @@ def test_risk_pyramid_guard():
     assert "already 1/1" in (risk.validate_execution("BUY", [{"side": "BUY", "profit": 1.20}], 1) or "")
 
 
-def test_set_max_positions_clamps_to_two_total():
+def test_set_max_positions_clamps_to_four_total():
     from bot.config import Settings
     from bot.engine import BotEngine
 
@@ -612,8 +617,9 @@ def test_set_max_positions_clamps_to_two_total():
         max_positions=1,
     )
     engine = BotEngine(settings)
-    assert engine.set_max_positions(8)["max_positions"] == 2
+    assert engine.set_max_positions(8)["max_positions"] == 4
     assert engine.set_max_positions(0)["max_positions"] == 1
+    assert engine.set_max_positions(4)["max_positions"] == 4
     assert engine.set_max_positions(2)["max_positions"] == 2
 
 
@@ -650,6 +656,21 @@ def test_algo_trading_off_retcode_is_human():
     assert "green" in msg
 
 
+def test_linux_requires_wine_terminal(monkeypatch, tmp_path):
+    import bot.mt5_broker as mt5_broker
+
+    monkeypatch.setattr(mt5_broker.sys, "platform", "linux")
+    monkeypatch.setenv("WINE_BIN", str(tmp_path / "no-wine"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "prefix"))
+    monkeypatch.setenv("DISPLAY", ":99")
+    try:
+        mt5_broker._prepare_wine_bridge("/unused")
+    except RuntimeError as exc:
+        assert "Wine not found" in str(exc)
+    else:
+        raise AssertionError("expected missing Wine binary to fail on Linux")
+
+
 def test_paper_buy_uses_ask_sell_uses_bid(tmp_path, monkeypatch):
     from bot.config import Settings
     from bot.paper_broker import PaperBroker
@@ -676,24 +697,17 @@ def test_paper_buy_uses_ask_sell_uses_bid(tmp_path, monkeypatch):
     assert sell.ok and abs(sell.price - 1.10000) < 1e-9
 
 
-def test_profit_peak_giveback_exit_is_armed_and_magic_scoped():
-    from bot.broker import OrderResult, Position
-    from bot.config import Settings
+def test_kotegawa_rm_is_hard_stop_and_two_r_no_trail():
     from bot.engine import BotEngine
-    class FakeBroker:
-        def __init__(self): self.closed = []
-        def close_one(self, symbol, ticket): self.closed.append(ticket); return OrderResult(True, "closed")
-    settings = Settings(trade_mode="demo", mt5_login=1, mt5_password="x", mt5_server="MetaQuotes-Demo", mt5_path="/tmp", symbol="EURUSD", risk_pct=.01, max_lot=.1, sl_pips=20, tp_pips=40, poll_seconds=1, dashboard_port=5055)
-    engine = BotEngine(settings); engine.broker = FakeBroker()
-    def pos(ticket, profit, magic): return Position("EURUSD", "BUY", .01, 1.1, profit, ticket, magic)
-    engine._apply_profit_lock([pos("t", 6, settings.magic)])
-    assert engine.broker.closed == []
-    assert engine._apply_profit_lock([pos("t", 4.5, settings.magic)])
-    assert engine.broker.closed == []
-    assert engine._apply_profit_lock([pos("t", 3.8, settings.magic)]) == []
-    assert engine.broker.closed == ["t"]
-    engine._apply_profit_lock([pos("manual", 10, 999)])
-    assert engine.broker.closed == ["t"]
+
+    settings = _desk_settings()
+    assert not hasattr(settings, "profit_arm_usd")
+    assert abs(settings.daily_loss_pct - 0.02) < 1e-12
+    assert abs(settings.risk_pct - 0.01) < 1e-12
+    engine = BotEngine(settings)
+    assert not hasattr(engine, "_apply_profit_lock")
+    assert session_drawdown_halt(-2000, 100000 * settings.daily_loss_pct, True) == "CLOSE"
+    assert session_drawdown_halt(-1999, 100000 * settings.daily_loss_pct, True) is None
 
 
 # ---------------------------------------------------------------------------
@@ -808,8 +822,9 @@ def test_gold_dollar_exits_use_one_dollar_pip():
     assert abs(take - 75.0) < 1e-9
     spec = exits_from_pullback(0.10, 500.0, symbol="XAUUSD")
     assert abs(spec.sl_pips - 500.0) < 1e-9
-    assert abs(spec.tp_pips - 750.0) < 1e-9
+    assert abs(spec.tp_pips - 1000.0) < 1e-9
     assert abs(spec.cut_usd - 50.0) < 1e-9
+    assert abs(spec.take_usd - 100.0) < 1e-9
     # the $10 FX pip would have claimed $500 of risk on the same ticket
     fx_take, fx_cut = pip_dollar_exits(0.10, 500.0, 750.0, symbol="EURUSD")
     assert abs(fx_cut - 500.0) < 1e-9
@@ -829,6 +844,13 @@ def test_gold_lot_sizing_is_one_percent_capped_at_max_lot():
     assert risk_lots > fx_lots * 5
     # actual risk taken at the cap: 700 pips x $1 x 0.10 lot = $70
     assert abs(700.0 * pip_value_per_lot("XAUUSD") * 0.10 - 70.0) < 1e-9
+
+
+def test_gold_lot_cap_is_tighter_than_fx():
+    settings = _desk_settings(max_lot=0.10, max_lot_xau=0.02)
+    assert settings.lot_cap("EURUSD") == 0.10
+    assert settings.lot_cap("XAUUSD") == 0.02
+    assert lot_for_budget(99594.0, 0.01, 700.0, settings.lot_cap("XAUUSD"), symbol="XAUUSD") == 0.02
 
 
 def test_gold_atr_floor_and_spread_cap_are_gold_scale():
@@ -868,7 +890,7 @@ def test_gold_macd_entry_passes_every_gate():
     assert a.checks["htf_gate"] == "ok"
     assert a.checks["rsi_gate"] == "ok"
     assert a.checks["pip_value"] == "1.00"
-    assert abs(a.tp_pips / a.sl_pips - 1.5) < 1e-9
+    assert abs(a.tp_pips / a.sl_pips - 2.0) < 1e-9
 
     s = analyze(
         _gold_ohlc(_gold_sell_closes()),
@@ -886,15 +908,15 @@ def test_gold_macd_entry_passes_every_gate():
     assert s.checks["zero"] == "above"
 
 
-def test_gold_htf_and_rsi_do_not_block_macd(monkeypatch):
+def test_gold_htf_and_rsi_block_macd(monkeypatch):
     bars = _gold_ohlc(_gold_buy_closes())
     kw = dict(session_start_hour=7, session_end_hour=16, min_atr_pips=500.0, max_spread_pips=80.0)
     disagree = analyze(bars, "XAUUSD", htf_h1="BUY", htf_h4="SELL", **kw)
-    assert disagree.action == "BUY"
-    assert disagree.checks.get("htf_gate") == "ignored"
+    assert disagree.action == "HOLD"
+    assert disagree.checks.get("htf_gate") == "blocked"
     monkeypatch.setattr("bot.analyst.rsi", lambda close, period=14: pd.Series([73.0] * len(close)))
     tired_buy = analyze(_gold_ohlc(_gold_buy_closes()), "XAUUSD", htf_h1="BUY", htf_h4="BUY", **kw)
-    assert tired_buy.action == "BUY"
+    assert tired_buy.action == "HOLD"
     assert tired_buy.checks.get("rsi_gate") == "exhaustion"
 
 
@@ -943,24 +965,24 @@ def test_gold_open_ticket_uses_dollar_pip_for_exits():
         peak_profit=20.0,
         position_volume=0.10,
         position_sl_pips=500.0,
-        position_tp_pips=750.0,
+        position_tp_pips=1000.0,
         session_start_hour=7,
         session_end_hour=16,
         min_atr_pips=500.0,
     )
-    # 1.5R take on 0.10 lot of gold is $75, not $750
-    assert a.checks["take_usd"] == "75.00"
+    # 2R take on 0.10 lot of gold is $100, not $1000
+    assert a.checks["take_usd"] == "100.00"
     assert a.checks["cut_usd"] == "50.00"
     assert a.action == "HOLD"
     banked = analyze(
         _gold_ohlc(_gold_buy_closes()),
         "XAUUSD",
         position_side="BUY",
-        position_profit=80.0,
-        peak_profit=80.0,
+        position_profit=110.0,
+        peak_profit=110.0,
         position_volume=0.10,
         position_sl_pips=500.0,
-        position_tp_pips=750.0,
+        position_tp_pips=1000.0,
         session_start_hour=7,
         session_end_hour=16,
         min_atr_pips=500.0,
@@ -1130,3 +1152,460 @@ def test_session_until_420_et():
         now=pd.Timestamp("2026-09-03 20:21:00", tz="UTC"),
     )
     assert "outside the configured session window" in " ".join(after.reasons)
+
+
+def test_history_lookback_zero_requests_from_2018():
+    from bot.config import Settings
+    from bot.engine import BotEngine
+
+    settings = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.01,
+        max_lot=0.10,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+        history_lookback_days=0,
+    )
+    engine = BotEngine(settings)
+    since = engine._history_since_ts()
+    assert since == 1514764800  # 2018-01-01 00:00:00 UTC
+    settings2 = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.01,
+        max_lot=0.10,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+        history_lookback_days=7,
+    )
+    engine2 = BotEngine(settings2)
+    assert engine2._history_since_ts() > since
+
+
+def test_mt5_closed_trades_pages_chunks_and_keeps_offbook_symbols():
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+
+    from bot.config import Settings
+    from bot.mt5_broker import MT5Broker
+
+    settings = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.01,
+        max_lot=0.10,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+    )
+    calls = []
+
+    class FakeMt5:
+        def history_deals_get(self, start, end):
+            calls.append((int(start), int(end)))
+            if int(start) < 1_700_000_000:
+                return []
+            return [
+                SimpleNamespace(
+                    entry=1,
+                    ticket=77,
+                    symbol="USDJPY",
+                    profit=2.5,
+                    swap=0,
+                    commission=0,
+                    type=0,
+                    time=int(datetime(2026, 9, 4, tzinfo=timezone.utc).timestamp()),
+                    volume=0.01,
+                    price=150.0,
+                    magic=26082601,
+                    comment="fomo-demo-bot",
+                )
+            ]
+
+    broker = MT5Broker.__new__(MT5Broker)
+    broker.settings = settings
+    broker.mt5 = FakeMt5()
+    rows = broker.closed_trades(int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()))
+    assert calls
+    assert calls[0][1] > calls[0][0]
+    assert calls[0][1] - calls[0][0] <= 14 * 86400 + 12 * 3600 + 60
+    if len(calls) > 1:
+        assert calls[0][1] >= calls[1][1]
+    assert len(calls) >= 2
+    n_first = len(calls)
+    rows_again = broker.closed_trades(int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()))
+    assert len(calls) == n_first + 1
+    assert len(rows) == 1
+    assert rows[0].symbol == "USDJPY"
+    assert rows[0].ticket == "77"
+    assert rows_again[0].ticket == "77"
+
+
+def test_mt5_closed_trades_keeps_recent_when_older_chunk_fails():
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+
+    from bot.config import Settings
+    from bot.mt5_broker import MT5Broker
+
+    settings = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.01,
+        max_lot=0.10,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+    )
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    class FakeMt5:
+        def history_deals_get(self, start, end):
+            if int(end) < now - 86400:
+                raise RuntimeError("Wine IPC timed out on history_deals")
+            return [
+                SimpleNamespace(
+                    entry=1,
+                    ticket=88,
+                    symbol="EURUSD",
+                    profit=1.25,
+                    swap=0,
+                    commission=0,
+                    type=0,
+                    time=now - 120,
+                    volume=0.01,
+                    price=1.17,
+                    magic=26082601,
+                    comment="fomo-demo-bot",
+                )
+            ]
+
+    broker = MT5Broker.__new__(MT5Broker)
+    broker.settings = settings
+    broker.mt5 = FakeMt5()
+    rows = broker.closed_trades(int(datetime(2018, 1, 1, tzinfo=timezone.utc).timestamp()))
+    assert [r.ticket for r in rows] == ["88"]
+
+
+def test_snapshot_puts_session_closes_on_top_of_mt5_history():
+    from bot.broker import AccountSnapshot, ClosedTrade
+    from bot.config import Settings
+    from bot.engine import BotEngine
+
+    settings = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.01,
+        max_lot=0.10,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+    )
+    engine = BotEngine(settings)
+    engine.recorded_closes = [
+        {
+            "time": "2026-09-08 18:01:00",
+            "utc_day": "2026-09-08",
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "volume": 0.01,
+            "price": 1.17,
+            "profit": 0.42,
+            "ticket": "LIVE-1",
+            "magic": 26082601,
+            "comment": "fomo-demo-bot",
+        }
+    ]
+
+    class _Feed:
+        name = "mt5-demo"
+
+        def refresh_account(self):
+            return AccountSnapshot("1", "MetaQuotes-Demo", "MQ", True, "demo", "USD", 100000, 100000)
+
+        def positions(self, symbol):
+            return []
+
+        def closed_trades(self, since_ts):
+            return [
+                ClosedTrade(
+                    time="2026-09-01 12:00:00",
+                    utc_day="2026-09-01",
+                    symbol="EURUSD",
+                    side="SELL",
+                    volume=0.01,
+                    price=1.16,
+                    profit=-1.1,
+                    ticket="OLD-1",
+                    magic=26082601,
+                    comment="fomo-demo-bot",
+                )
+            ]
+
+    engine.broker = _Feed()
+    engine.broker_name = "mt5-demo"
+    engine.account = engine.broker.refresh_account()
+    snap = engine.snapshot()
+    tickets = [t["ticket"] for t in snap["closed_trades"]]
+    assert tickets[:2] == ["LIVE-1", "OLD-1"]
+
+
+def test_merge_trade_rows_dedupes_and_sorts_newest_first():
+    from bot.engine import merge_trade_rows
+
+    rows = merge_trade_rows(
+        [{"ticket": "A", "time": "2026-09-09 12:00:00", "profit": -0.12}],
+        [
+            {"ticket": "B", "time": "2026-09-09 22:19:09", "profit": -45.4},
+            {"ticket": "A", "time": "2026-09-09 12:00:00", "profit": -0.12},
+        ],
+    )
+    assert [r["ticket"] for r in rows] == ["B", "A"]
+    assert rows[0]["profit"] == -45.4
+
+
+def test_snapshot_merges_mt5_history_when_fills_are_paper():
+    from bot.broker import AccountSnapshot, ClosedTrade
+    from bot.config import Settings
+    from bot.engine import BotEngine
+
+    settings = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.01,
+        max_lot=0.10,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+        fill_venue="paper",
+    )
+    engine = BotEngine(settings)
+    engine.fill_venue = "paper"
+    engine.broker_name = "paper"
+
+    class _Paper:
+        name = "paper"
+
+        def refresh_account(self):
+            return AccountSnapshot("1", "MetaQuotes-Demo", "MQ", True, "demo", "USD", 100000, 100000)
+
+        def positions(self, symbol):
+            return []
+
+        def closed_trades(self, since_ts):
+            return [
+                ClosedTrade(
+                    time="2026-09-09 21:00:00",
+                    utc_day="2026-09-09",
+                    symbol="EURUSD",
+                    side="BUY",
+                    volume=0.01,
+                    price=1.17,
+                    profit=-0.12,
+                    ticket="PAPER-1",
+                    magic=26082602,
+                    comment="paper",
+                )
+            ]
+
+    class _Mt5:
+        name = "mt5-demo"
+
+        def refresh_account(self):
+            return AccountSnapshot("1", "MetaQuotes-Demo", "MQ", True, "demo", "USD", 100000, 100000)
+
+        def positions(self, symbol):
+            return []
+
+        def closed_trades(self, since_ts):
+            return [
+                ClosedTrade(
+                    time="2026-09-09 22:19:09",
+                    utc_day="2026-09-09",
+                    symbol="XAUUSD",
+                    side="BUY",
+                    volume=0.01,
+                    price=4402.05,
+                    profit=-45.4,
+                    ticket="58008252126",
+                    magic=26082601,
+                    comment="[sl 4402.05]",
+                )
+            ]
+
+    engine.broker = _Paper()
+    engine.feed = _Mt5()
+    engine.account = engine.broker.refresh_account()
+    snap = engine.snapshot()
+    tickets = [t["ticket"] for t in snap["closed_trades"]]
+    assert tickets[0] == "58008252126"
+    assert any(abs(float(t["profit"]) - (-45.4)) < 0.001 for t in snap["closed_trades"])
+    assert "PAPER-1" in tickets
+    assert "kronos" in (snap["books"].get("EURUSD") or {})
+
+
+def test_atr_floor_blocks_inside_analyze():
+    bars = _ohlc(_buy_macd_closes())
+    dead = analyze(
+        bars,
+        "EURUSD",
+        session_start_hour=7,
+        session_end_hour=16,
+        min_atr_pips=50.0,
+        htf_h1="BUY",
+        htf_h4="BUY",
+    )
+    assert dead.action == "HOLD"
+    assert dead.checks.get("atr_gate") == "blocked"
+    assert "atr" in " ".join(dead.reasons).lower()
+
+
+def test_flat_ema200_skips_entry(monkeypatch):
+    bars = _ohlc(_buy_macd_closes())
+    monkeypatch.setattr(
+        "bot.analyst.ema200_flat",
+        lambda e200, atr_price, lookback=20, frac=0.15: "EMA200 flat over 20 bars — skip",
+    )
+    a = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="BUY", htf_h4="BUY")
+    assert a.action == "HOLD"
+    assert a.checks.get("ema200_slope") == "flat"
+    assert "ema200 flat" in " ".join(a.reasons).lower()
+
+
+def test_stretched_move_skips_late_entry(monkeypatch):
+    bars = _ohlc(_buy_macd_closes())
+    monkeypatch.setattr(
+        "bot.analyst.stretched_move",
+        lambda bars, side, atr_price, n_bars=2, frac=0.70: "stretched BUY — skip late entry",
+    )
+    a = analyze(bars, "EURUSD", session_start_hour=7, session_end_hour=16, htf_h1="BUY", htf_h4="BUY")
+    assert a.action == "HOLD"
+    assert a.checks.get("stretch_gate") == "blocked"
+    assert "stretched" in " ".join(a.reasons).lower()
+
+
+def test_ema200_flat_helper_threshold():
+    from bot.analyst import ema200_flat, EMA_FLAT_LOOKBACK
+
+    e = pd.Series([1.10] * (EMA_FLAT_LOOKBACK + 5))
+    assert ema200_flat(e, atr_price=0.0010) is not None
+    rising = pd.Series([1.10 + i * 0.00005 for i in range(EMA_FLAT_LOOKBACK + 5)])
+    assert ema200_flat(rising, atr_price=0.0010) is None
+
+
+def test_stretched_move_helper_threshold():
+    from bot.analyst import stretched_move
+
+    base = 1.1000
+    rows = [{"open": base, "high": base + 0.0001, "low": base - 0.0001, "close": base} for _ in range(5)]
+    rows.append({"open": base, "high": base + 0.0009, "low": base - 0.0001, "close": base + 0.0008})
+    bars = pd.DataFrame(rows)
+    assert stretched_move(bars, "BUY", atr_price=0.0010) is not None
+    assert stretched_move(bars, "SELL", atr_price=0.0010) is None
+
+
+def test_take_htf_report_only_fills_when_ready(monkeypatch, tmp_path):
+    from bot.broker import OrderResult
+    from bot.config import Settings
+    from bot.engine import BotEngine
+    import bot.engine as engine_mod
+    from bot.htf_sweep import desk_report, empty_report
+
+    monkeypatch.setattr(engine_mod, "STATE_PATH", tmp_path / "runtime.json")
+    settings = Settings(
+        trade_mode="demo",
+        mt5_login=1,
+        mt5_password="x",
+        mt5_server="MetaQuotes-Demo",
+        mt5_path="/tmp",
+        symbol="EURUSD",
+        risk_pct=0.02,
+        max_lot=0.01,
+        sl_pips=20,
+        tp_pips=40,
+        poll_seconds=1,
+        dashboard_port=5055,
+        mutex_required=False,
+        news_blackout=False,
+        weekend_guard=False,
+    )
+    engine = BotEngine(settings)
+    engine.running = True
+
+    class Brok:
+        name = "paper"
+
+        def positions(self, symbol):
+            return []
+
+        def sell(self, symbol, lot, sl, tp):
+            return OrderResult(True, f"paper SELL {symbol} {lot}", "R-SELL")
+
+        def buy(self, symbol, lot, sl, tp):
+            return OrderResult(True, f"paper BUY {symbol} {lot}", "R-BUY")
+
+    engine.broker = Brok()
+    engine.feed = Brok()
+    engine.broker_name = "paper"
+    engine._refresh_htf_report = lambda *a, **k: desk_report(
+        empty_report("H1 has not swept a swing. No trade from M15 or M5.")
+    )
+    blocked = engine.take_htf_report("EURUSD")
+    assert blocked["ok"] is False
+    assert "H1" in blocked["message"]
+
+    ready = desk_report(
+        {
+            "ready": True,
+            "action": "SELL",
+            "bias": "SELL",
+            "signal": "sell",
+            "h1": {"state": "sweep", "label": "ok"},
+            "m15": {"state": "ok", "label": "ok"},
+            "m5": {"state": "ok", "label": "ok"},
+            "why": "H1 SELL sweep → M15 confirm → M5 order block.",
+            "sl_pips": 12.0,
+            "tp_pips": 18.0,
+            "cross_bar": "2026-09-10T12:00:00Z",
+        }
+    )
+    engine._refresh_htf_report = lambda *a, **k: ready
+    hit = engine.take_htf_report("EURUSD")
+    assert hit["ok"] is True
+    assert hit["ticket"] == "R-SELL"
+    replay = engine.take_htf_report("EURUSD")
+    assert replay["ok"] is False
+    assert "already used" in replay["message"]

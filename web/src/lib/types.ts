@@ -11,6 +11,7 @@ export type ClosedTrade = {
   ticket?: string;
   magic?: number | null;
   comment?: string;
+  venue?: string;
 };
 
 export type Position = {
@@ -20,9 +21,42 @@ export type Position = {
   price: number;
   profit: number;
   ticket: string;
+  magic?: number | null;
+  venue?: string;
   verdict?: string;
   why?: string;
   pnl_state?: string;
+};
+
+export type NewsHit = {
+  name?: string;
+  symbol?: string;
+  when?: string;
+  until?: string;
+  until_et?: string;
+  reason?: string;
+};
+
+export type NewsStatus = {
+  enabled?: boolean;
+  pairs?: string[];
+  active?: NewsHit[];
+  next?: {
+    name?: string;
+    when?: string;
+    when_et?: string;
+    minutes?: number;
+    label?: string;
+  } | null;
+};
+
+export type KronosHud = {
+  enabled?: boolean;
+  predicted?: string | null;
+  bps?: number | null;
+  age_sec?: number | null;
+  allow_buy?: boolean;
+  allow_sell?: boolean;
 };
 
 export type Analysis = {
@@ -36,6 +70,25 @@ export type Analysis = {
   atr_pips?: number;
   reasons?: string[];
   checks?: Record<string, string>;
+};
+
+export type HtfStage = {
+  state?: string;
+  label?: string;
+};
+
+export type HtfReport = {
+  ready?: boolean;
+  action?: string;
+  bias?: string;
+  signal?: string;
+  h1?: HtfStage;
+  m15?: HtfStage;
+  m5?: HtfStage;
+  why?: string;
+  sl_pips?: number;
+  tp_pips?: number;
+  cross_bar?: string;
 };
 
 export type SymbolBook = {
@@ -59,6 +112,9 @@ export type SymbolBook = {
   macd_wins?: number;
   macd_win_rate?: number | null;
   macd_net?: number | null;
+  kronos?: KronosHud;
+  news?: NewsHit | null;
+  htf_report?: HtfReport;
 };
 
 export type BotState = {
@@ -112,8 +168,8 @@ export type BotState = {
   open_count?: number;
   max_positions?: number;
   max_positions_total?: number;
-  profit_arm_usd?: number;
-  profit_giveback_pct?: number;
+  daily_loss_pct?: number;
+  reward_r?: number;
   bankroll?: number;
   next_lot?: number;
   risk_pct?: number;
@@ -132,6 +188,7 @@ export type BotState = {
   htf?: string | null;
   h1?: string | null;
   h4?: string | null;
+  htf_report?: HtfReport;
   symbols?: string[];
   focus?: string;
   books?: Record<string, SymbolBook>;
@@ -153,6 +210,10 @@ export type BotState = {
   blockers?: string[];
   logs?: string[];
   updated?: string;
+  news?: NewsStatus;
+  atr_gate?: boolean;
+  news_blackout?: boolean;
+  monday_open_skip_min?: number;
   login?: number | string;
   server?: string;
   venue?: string;
@@ -208,8 +269,8 @@ export type ApiResult = {
   ticket?: string;
   max_positions?: number;
   max_positions_total?: number;
-  profit_arm_usd?: number;
-  profit_giveback_pct?: number;
+  daily_loss_pct?: number;
+  reward_r?: number;
   fill_venue?: string;
 };
 
@@ -217,6 +278,10 @@ export type UnlockStatus = {
   ok?: boolean;
   required: boolean;
   unlocked: boolean;
+  method?: "totp" | "pin" | "off";
+  show_qr?: boolean;
+  issuer?: string;
+  account?: string;
   message?: string;
 };
 

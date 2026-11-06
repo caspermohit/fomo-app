@@ -1,8 +1,10 @@
 # FOMO current state — improve from here
 
-Snapshot of the repo as of 28 Aug 2026. Use this file as the brief for the next iteration. **Demo only.** Do not enable live trading. Do not paste MT5 passwords. `TRADE_MODE` must stay `demo`. Live servers are hard-blocked in Python and the EA.
+Snapshot of the repo as of 10 Sep 2026 (day_range strategy mode added). Use this file as the brief for the next iteration. **Demo only.** Do not enable live trading. Do not paste MT5 passwords. `TRADE_MODE` must stay `demo`. Live servers are hard-blocked in Python and the EA.
 
 The root `README.md` is stale (it still describes a $50 dummy bankroll). This file is the source of truth.
+
+**11 Sep 2026:** Demo book cap raised — `MAX_POSITIONS=4` (UI/env clamp 1–4). Still 1 ticket per symbol. Live remains blocked.
 
 ---
 
@@ -47,6 +49,8 @@ cd web && npm run dev
 
 ```
 bot/analyst.py           Bill open rules (H1 trend) + ATR multiples for SL/TP
+bot/day_range.py         Optional STRATEGY=day_range CRT prior-day PDH/PDL (demo)
+bot/vwap_ema.py          Optional STRATEGY=vwap_ema Austin VWAP+EMA9 (demo)
 bot/risk.py              sizing, pyramid, mixed-side, session drawdown only
 bot/mutex.py             magic 26082601 heartbeat (Python owns; leftover EA detection)
 bot/engine.py            1s loop, bankroll, fill venue, snapshot; never yields to an EA
@@ -57,6 +61,7 @@ bot/health.py            GET /api/health (demo lock, Wine IPC, processes)
 bot/dashboard.py         Flask API
 bot/auth.py              DESK_PIN cookie gate
 bot/config.py            .env → Settings (live blocked, mutex on)
+bot/news_calendar.py     USD CPI/NFP/FOMC skip window (gold default)
 bot/pnl.py               closed/floating P&L summary
 run.py                   start engine + Flask (no reloader)
 
@@ -90,19 +95,49 @@ Python (`bot/analyst.py`) follows the [Trading Rush MACD 100-trade test](https:/
 | Check | Rule |
 |---|---|
 | Trend | Close vs **EMA200**. Long only if close > EMA200. Short only if close < EMA200. |
-| HTF | H1/H4 EMA21 is **display only**. The 100-trade article does not use it as an entry gate. |
+| HTF | **Real gate:** H1 + H4 EMA21 must both agree with the MACD side (HOLD/disagree → skip). |
+| RSI | **Real gate:** no BUY if RSI(14) > 70; no SELL if RSI(14) < 30. |
+| ATR | **Real gate:** M5 ATR below pair floor (EUR 4 / JPY 8 / XAU 500) → skip dead tape. |
+| Flat EMA200 | **Skip** if |ΔEMA200| over last **20** M5 bars < **0.15×ATR** (near-flat slope). |
+| Stretched | **Skip** if signal candle / last **1–2** bars already ran ≥ **0.70×ATR** in trade direction (close-path). |
 | Entry | Default **MACD 12/26/9**. BUY: MACD crosses **above** signal **below zero**. SELL: MACD crosses **below** signal **above zero**. Entry on the **cross-bar close**. |
 | Stop | Beyond the pullback (last-5 M5 swing and/or EMA200, plus 1 pip). |
-| Take | **1.5R** (the backtest clip on that page). |
+| Take | **2R** vs the pullback stop (Kotegawa package; not the old 1.5R Trading Rush clip). |
 | Spread | Block if spread above the per-symbol cap (broker hygiene). |
 | Session | **07:00–20:20 UTC**. Weekend guard on. |
-| Size | **1%** of demo equity vs SL pips, capped by `MAX_LOT` **0.10**. |
-| Scale-in | **Max 1** ticket per symbol, **max 2 open tickets total**. |
+| Size | **1%** of demo equity vs SL pips, capped by `MAX_LOT` **0.10**. Same size after a loss — no revenge scale-up. |
+| Daily halt | Flatten / no new tickets when **today's P&L ≤ −2%** of equity (`DAILY_LOSS_PCT`). |
+| Scale-in | **Max 1** ticket per symbol, **max 4 open tickets total** (demo). No averaging losers. |
 | Fills | Buys at **ask**, sells at **bid**. |
 
-While a Python position is open, the analyst closes on the frozen pullback SL / 1.5R TP from entry. A bot-managed ticket arms at $3.00 peak floating profit, then closes immediately on a 35% peak-profit giveback; this is in addition to broker SL/TP. Broker SL/TP remain on every ticket.
+Open tickets exit on the frozen pullback SL / 2R TP from entry. Broker SL/TP only — **no** profit-arm / giveback trail / % loss-cut overlay.
 
 ---
+
+## Optional STRATEGY modes (demo only)
+
+`STRATEGY` env selects the analyst path. Default **`macd`** — current desk behavior unchanged.
+
+| Value | Behavior |
+|---|---|
+| `macd` (default) | Existing Trading Rush MACD 12/26/9 path. Optional Kronos agree-gate applies only here. |
+| `vwap_ema` | Austin McConnell demo path: session **VWAP** (direction / invalidation) + **EMA9** (timing). Entry is a fresh EMA9 cross of VWAP on the closed M5 bar with price on the same side of VWAP. Kotegawa 1% / 2R / 2% daily halt. Kronos skipped. |
+| `day_range` | DEMO-ONLY CRT-style prior-day range. Uses previous completed D1 candle: **PDH / PDL / mid=(PDH+PDL)/2**. On **M15** (fallback **M5**): after a liquidity sweep of PDH then close back inside the prior-day range while price is **above mid** → **SELL**; sweep of PDL then reclaim while **below mid** → **BUY**. Within `DAY_RANGE_MID_BAND_PCT` (default 5% of day range) of mid → no trade. Must reclaim **inside** [PDL, PDH]. |
+
+**day_range v1 exits:** SL beyond the sweep extreme (+1 pip buffer); **TP at mid (TP1)**. TP2 at the opposite extreme is phase 2 — not implemented. Still one ticket per symbol, `MAX_POSITIONS`, session window, weekend guard, `HARD_BLOCK_LIVE`, demo only.
+
+Enable on this Mac (restart `python run.py` after):
+
+```bash
+# in .env
+STRATEGY=day_range
+DAY_RANGE_MID_BAND_PCT=0.05
+DAY_RANGE_TIMEFRAME=M15
+```
+
+Leave `STRATEGY=macd` (or unset) to go back to MACD. Do not enable live. Kronos is skipped when `STRATEGY=day_range` or `STRATEGY=vwap_ema`.
+
+Layout: `bot/day_range.py`, `bot/vwap_ema.py`, tests in `tests/test_day_range.py` and `tests/test_vwap_ema.py`.
 
 ## Python bot
 
@@ -111,7 +146,7 @@ While a Python position is open, the analyst closes on the frozen pullback SL / 
 - Bankroll: **MT5 demo equity** (often ~$100k). `$50` dummy is gone.
 - Size: `1%` of equity vs analyst SL pips, capped by `MAX_LOT` (default **0.10**). On ~$99,999 equity that is **0.10 lots** (~$1/pip). Not 10 lots.
 - Session loss stop: **20% of demo equity**.
-- Max concurrent tickets: `MAX_POSITIONS` default **1**, UI/env clamp **1**. No mixed BUY+SELL. Engine passes `require_pyramid_winners=True`. Entry only on a fresh MACD cross bar. Skip the second pair if the first is already open.
+- Max concurrent tickets: `MAX_POSITIONS` **4** on this demo desk (UI/env clamp **1–4**). Still **1 ticket per symbol**. No mixed BUY+SELL. Engine passes `require_pyramid_winners=True`. Entry only on a fresh MACD cross bar.
 - Mutex: `EXECUTION_MUTEX_REQUIRED=true`. Python heartbeats `FOMO_PYTHON_ENGINE_ACTIVE`. Python never yields. A leftover trading EA on the chart is a health warning, not a second bot.
 - Feed vs broker: `self.feed` is quotes; `self.broker` is fills. If MT5 attach fails, engine can fall back to paper fills.
 
@@ -152,7 +187,7 @@ Optional extra lock: Cloudflare Access on the hostname, policy **only your email
 
 Next.js app in `web/`. Proxies `/api/*` to Flask `:5055`. Polls `/api/state` every 1s and `/api/health` every 5s.
 
-Shows: METATRADER ON/OFF, RETRY MT5, START/STOP, BUY/SELL at next lot, close per ticket, close all, paper vs MT5 fills, max 2 total tickets, peak-giveback profit exit (arm $3, giveback 35%), analyst score/RSI/ATR, equity, blockers, closed history.
+Shows: METATRADER ON/OFF, RETRY MT5, START/STOP, BUY/SELL at next lot, close per ticket, close all, paper vs MT5 fills, max 4 total tickets (demo), Kotegawa RM (1% / 2R / 2% daily halt, no trail), analyst score/RSI/ATR, equity, blockers, closed history.
 
 Header wraps so UTC / START-STOP do not clip. Client swallows Urban VPN `chrome-extension://` noise (`instrumentation-client.ts`).
 
@@ -178,6 +213,8 @@ Compile note: `scripts/install_mt5_indicator.sh` compiles via `Z:` path and **mu
 
 ## Risk / env (current)
 
+Kotegawa / BNF (Takashi Kotegawa) money management on demo: **1% per ticket**, hard SL at structure, **2R take**, **2% daily halt**, never size up after a loss. Trail / giveback / % loss-cut overlays are gone.
+
 ```
 TRADE_MODE=demo
 MT5_SERVER=MetaQuotes-Demo
@@ -188,9 +225,8 @@ MAX_LOT=0.10
 SL_PIPS=20
 TP_PIPS=40
 POLL_SECONDS=1
-MAX_POSITIONS=2
-PROFIT_ARM_USD=3.0
-PROFIT_GIVEBACK_PCT=0.35
+MAX_POSITIONS=4
+DAILY_LOSS_PCT=0.02
 FILL_VENUE=mt5
 HARD_BLOCK_LIVE=true
 EXECUTION_MUTEX_REQUIRED=true
@@ -210,16 +246,15 @@ MAX_SPREAD_PIPS_XAU=80.0
 DESK_PIN=
 ```
 
-SL/TP env pip values are unused for new tickets. Broker stops come from the analyst pullback distance; take is **1.5R**.
+SL/TP env pip values are unused for new tickets. Broker stops come from the analyst pullback distance; take is **2R**. Daily halt is **2%** of equity. No profit-trail overlay.
 
 ---
 
 ## Gold (XAUUSD) — third symbol, same rules
 
 Added 3 Sep 2026. **Same strategy, no rule changes**: MACD 12/26/9 fresh cross, M5 EMA200 agreement,
-H1+H4 bias agreement, RSI(14) exhaustion filter, pullback SL, 1.5R TP, 07:00-20:20 UTC session,
-1% risk sizing, magic 26082601, max 1 ticket per symbol and max 2 tickets total, peak-giveback exit
-(arm $3.00, give back 35%).
+H1+H4 bias agreement, RSI(14) exhaustion filter, pullback SL, 2R TP, 07:00-20:20 UTC session,
+1% risk sizing, magic 26082601, max 1 ticket per symbol and max 4 tickets total (demo). Hard SL/TP only.
 
 Verified on this demo account (read-only probe, no orders): `mt5.symbol_info("XAUUSD")` resolves to
 `Metals\XAUUSD` "Gold vs US Dollar", `digits=2`, `point=0.01`, `volume_min/step=0.01`, `volume_max=100`,
@@ -241,8 +276,8 @@ What is gold-specific:
 
 ## What is actually true in the market
 
-- London hours only (`7–16 UTC`). Auto-open needs **M5 close vs EMA200**, a **fresh MACD 12/26/9 cross on the correct side of zero**, and **spread ≤ 2 pips**. Entry is the cross-bar close.
-- Size cap is **0.10 lot**. Stop is **beyond the pullback**; take is **1.5R**. **No new tickets Fri 21:00–Sun 21:00 UTC**; open tickets flatten at the weekend. After a stop, **5 minutes** with no new entry. Max **1** ticket per pair; do not open the second pair while the first is live.
+- Session **07:00–20:20 UTC**. Auto-open needs **M5 close vs EMA200**, **fresh MACD 12/26/9 cross on the correct side of zero**, **H1+H4 agree**, RSI not exhausted, ATR above floor, EMA200 not flat, not stretched, and **spread ≤ cap**. Entry is the cross-bar close.
+- Size cap is **0.10 lot**. Stop is **beyond the pullback**; take is **2R**. Daily halt **−2%** equity. **No new tickets Fri 21:00–Sun 21:00 UTC**; open tickets flatten at the weekend. After a stop, **5 minutes** with no new entry. Max **1** ticket per pair; max **4** open tickets total on demo.
 - Closed history can mix old `PAPER-*` tickets, old 10-lot tickets, and current 0.01 tickets.
 
 ---
@@ -254,8 +289,8 @@ What is gold-specific:
 - [ ] Analyst is Bill’s H1-with-trend money-management experiment, not a tested edge. No walk-forward, no spread/commission model, no hold-out. The source video is not a live audited result.
 - [x] Python poll aligned to 1s (thread sleep, not a native tick stream).
 - [x] Python owns 0.5×ATR TP / 2.8×ATR SL (high-hit scalp). The Expert does not trade.
-- [x] Session defaults to London/NY (`SESSION_START_HOUR=7`, `SESSION_END_HOUR=20 SESSION_END_MINUTE=20`). No news filter, no rollover, no Monday open.
-- [x] ATR floor is 3.0 pips so dead tape actually blocks.
+- [x] Session defaults to London/NY (`SESSION_START_HOUR=7`, `SESSION_END_HOUR=20 SESSION_END_MINUTE=20`). USD news blackout on gold (`NEWS_BLACKOUT`, default XAUUSD). Monday-open skip 30m after Sunday 21:00 UTC.
+- [x] ATR floor + HTF + RSI + flat EMA200 + stretched-move are **real** `analyze()` blockers (engine still overlays `ATR_GATE`). Demo only; `HARD_BLOCK_LIVE=true`.
 - [x] Open gate is H1+H4 trend + M5 EMA21 pullback, not a 60s clock and not score 4/8.
 - [x] Size cap is 0.10 lot, max 1 ticket per pair (UI clamp 1–2). No averaging into losers.
 - [x] `decide()` and `bot/strategy.py` removed. Risk is gates only; analyst owns signal.
@@ -287,6 +322,36 @@ What is gold-specific:
 
 ---
 
+## Kronos-mini DEMO filter (optional gate)
+
+Added 9 Sep 2026. **Demo only.** Does not replace MACD Bill. When `KRONOS_FILTER=false`
+(default), behavior is unchanged. When `true`, a fresh MACD entry also needs Kronos-mini
+forecast slope/direction to agree (CHOP / opposite / missing / stale → skip).
+
+- `bot/kronos_filter.py` — reads `data/kronos_decisions.json`
+- `scripts/export_m5_for_kronos.py` — MT5 M5 OHLCV → CSV for EURUSD/GBPJPY/XAUUSD
+- `scripts/run_kronos_demo_filter.py` — scp → casperserver `~/kronos` → forecast → pull JSON
+- `scripts/kronos_demo_filter_forecast.py` — server-side Kronos-mini inference
+- Keep `HARD_BLOCK_LIVE=true`. Never enable live. Refresh decisions before relying on the gate.
+
+Toggle: `KRONOS_FILTER=true` in `.env`, then restart `python run.py`.
+
+---
+
+## USD news blackout (gold only by default)
+
+Added 10 Sep 2026. **Not an entry engine.** APFX-style gold vs USD data (CPI / NFP / unemployment / FOMC) is encoded as a **skip** around the print, not as a BUY/SELL. Kronos and MACD still own direction.
+
+- `bot/news_calendar.py` — 2026 CPI / NFP / FOMC / PCE / GDP in America/New_York (DST-aware)
+- Default window: 30 minutes before, 20 after (FOMC keeps 60 after for the presser)
+- Default pair: `XAUUSD` only (`NEWS_PAIRS`). EURUSD/GBPJPY still trade through the print
+- Does **not** flatten open gold. New tickets only.
+- Desk Why shows the gate and the next print
+
+Also: `ATR_GATE` skips quiet tape; `MONDAY_OPEN_SKIP_MIN` skips the first half-hour after Sunday 21:00 UTC.
+
+---
+
 ## Hard rules for the next change
 
 1. Stay on **demo**. Do not set live. Do not dump `.env` secrets.
@@ -305,7 +370,7 @@ What is gold-specific:
 1. **One desk.** Done — Python is the only bot. Expert is display-only.
 2. **Unify exits.** Done — ATR multiples (2.0× TP / 1.5× SL), not % of price.
 3. **Honest size.** Cap is **0.10**. Do not silently restore 10 lots.
-4. **MACD Bill on demo.** M5 EMA200 + MACD 12/26/9, pullback SL, 1.5R TP, max 1 ticket. Not a proven edge.
+4. **MACD Bill on demo.** M5 EMA200 + MACD 12/26/9, pullback SL, 2R TP, max 1 ticket. Not a proven edge.
 4. **Same-score test.** Fixture of M5 bars → expected score; assert Python and a documented MQL5 port match.
 5. **Refresh README** from this file so the runbook is not lying.
 6. **Only then** consider a different symbol/timeframe or a real backtest — not more lot size.

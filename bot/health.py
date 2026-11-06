@@ -64,6 +64,10 @@ def script_paths(settings) -> dict:
     mt5_path = Path(getattr(settings, "mt5_path", "") or "")
     if not mt5_path.exists():
         missing.append(str(mt5_path) or "MT5_PATH")
+    elif mt5_path.is_dir() and not (mt5_path / "Contents").exists():
+        terminal = mt5_path / "drive_c" / "Program Files" / "MetaTrader 5" / "terminal64.exe"
+        if not terminal.exists() and not (mt5_path / "terminal64.exe").exists():
+            missing.append(str(terminal))
     if not AGENT_PATH.exists():
         missing.append(str(AGENT_PATH))
     files = mql5_files_dir()
@@ -181,6 +185,10 @@ def build_report(engine) -> dict:
         if status == "HEALTHY":
             status = "DEGRADED"
 
+    from bot.config import parse_strategy
+
+    strategy = parse_strategy(getattr(settings, "strategy", "macd"))
+
     return {
         "status": status,
         "timestamp": time.time(),
@@ -194,6 +202,7 @@ def build_report(engine) -> dict:
         "warnings": warnings,
         "error_reason": error_reason,
         "paths": paths,
+        "strategy": strategy,
     }
 
 

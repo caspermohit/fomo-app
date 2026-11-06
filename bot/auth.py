@@ -1,4 +1,4 @@
-"""PIN unlock for the desk API. Local stays open when DESK_PIN is empty."""
+"""Desk unlock cookie. TOTP authenticator when DESK_TOTP_SECRET is set; else optional DESK_PIN."""
 
 from __future__ import annotations
 
@@ -17,10 +17,23 @@ MAX_FAILS = 8
 OPEN_PATHS = {("/api/unlock", "GET"), ("/api/unlock", "POST")}
 
 _FAILS: dict[str, list[float]] = {}
+_USED_TOTP_STEP: dict[str, int] = {}
+
+
+def totp_secret() -> str:
+    return os.getenv("DESK_TOTP_SECRET", "").strip().replace(" ", "").replace("-", "")
 
 
 def pin_required() -> bool:
-    return bool(os.getenv("DESK_PIN", "").strip())
+    return bool(totp_secret() or os.getenv("DESK_PIN", "").strip())
+
+
+def auth_method() -> str:
+    if totp_secret():
+        return "totp"
+    if os.getenv("DESK_PIN", "").strip():
+        return "pin"
+    return "off"
 
 
 def cookie_secret() -> str:
@@ -29,7 +42,7 @@ def cookie_secret() -> str:
         return explicit
     pin = os.getenv("DESK_PIN", "").strip()
     login = os.getenv("MT5_LOGIN", "").strip()
-    return hashlib.sha256(f"fomo-desk-v1|{pin}|{login}".encode()).hexdigest()
+    return hashlib.sha256(f"fomo-desk-v2|{totp_secret()}|{pin}|{login}".encode()).hexdigest()
 
 
 def mint_token(now: float | None = None) -> str:
@@ -53,12 +66,47 @@ def token_ok(value: str | None, now: float | None = None) -> bool:
     return hmac.compare_digest(sig, expected)
 
 
+def _digits(got: str) -> str:
+    return "".join(ch for ch in str(got or "") if ch.isdigit())
+
+
 def pin_matches(got: str) -> bool:
     expected = os.getenv("DESK_PIN", "").strip()
     if not expected:
         return True
     digest = lambda s: hashlib.sha256(s.encode()).digest()
     return hmac.compare_digest(digest(got.strip()), digest(expected))
+
+
+def totp_matches(got: str) -> bool:
+    secret = totp_secret()
+    if not secret:
+        return False
+    code = _digits(got)
+    if len(code) < 6:
+        return False
+    try:
+        import pyotp
+    except ImportError:
+        return False
+    totp = pyotp.TOTP(secret)
+    now = time.time()
+    for offset in (-1, 0, 1):
+        t = now + offset * totp.interval
+        if not totp.verify(code, for_time=t, valid_window=0):
+            continue
+        step = int(t) // totp.interval
+        if _USED_TOTP_STEP.get(secret) == step:
+            return False
+        _USED_TOTP_STEP[secret] = step
+        return True
+    return False
+
+
+def code_matches(got: str) -> bool:
+    if totp_secret():
+        return totp_matches(got)
+    return pin_matches(got)
 
 
 def client_ip(request: Request) -> str:
@@ -82,6 +130,10 @@ def record_fail(ip: str, now: float | None = None) -> None:
 
 def clear_fails(ip: str) -> None:
     _FAILS.pop(ip, None)
+
+
+def clear_totp_replay() -> None:
+    _USED_TOTP_STEP.clear()
 
 
 def cookie_secure(request: Request) -> bool:
@@ -116,17 +168,130 @@ def clear_unlock_cookie(response: Response) -> Response:
     return response
 
 
+TOTP_ISSUER = "FOMO"
+TOTP_ACCOUNT = "desk"
+
+
+def enroll_qr_allowed(request: Request) -> bool:
+    """QR on the lock screen: localhost, or DESK_TOTP_SHOW_QR=true. Never on a public IP by default."""
+    flag = os.getenv("DESK_TOTP_SHOW_QR", "").strip().lower()
+    if flag in {"1", "true", "yes"}:
+        return True
+    host = (request.host or "").split(":")[0].lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def totp_uri() -> str:
+    secret = totp_secret()
+    if not secret:
+        return ""
+    import pyotp
+
+    return pyotp.TOTP(secret).provisioning_uri(name=TOTP_ACCOUNT, issuer_name=TOTP_ISSUER)
+
+
+def totp_qr_png(uri: str | None = None) -> bytes:
+    data = uri or totp_uri()
+    if not data:
+        return b""
+    import io
+
+    import qrcode
+
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#050c09", back_color="#ffffff")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def totp_enrolled() -> bool:
+    return os.getenv("DESK_TOTP_ENROLLED", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _upsert_env(key: str, value: str) -> None:
+    from bot.config import ROOT
+
+    path = ROOT / ".env"
+    lines = path.read_text().splitlines() if path.is_file() else []
+    out, seen = [], False
+    for line in lines:
+        raw = line.strip()
+        env_key = ""
+        if raw and not raw.startswith("#") and "=" in line:
+            env_key = line.split("=", 1)[0].strip()
+        if env_key == key:
+            out.append(f"{key}={value}")
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        if out and out[-1] != "":
+            out.append("")
+        out.append(f"{key}={value}")
+    path.write_text("\n".join(out) + "\n")
+    os.environ[key] = value
+
+
+def write_totp_secret(secret: str) -> None:
+    secret = secret.strip().replace(" ", "").replace("-", "")
+    _upsert_env("DESK_TOTP_SECRET", secret)
+    _upsert_env("DESK_TOTP_ENROLLED", "false")
+    clear_totp_replay()
+
+
+def mark_totp_enrolled() -> None:
+    _upsert_env("DESK_TOTP_ENROLLED", "true")
+
+
+def lock_screen_qr_allowed(request: Request) -> bool:
+    """Setup QR on the lock screen until the first successful unlock, unless forced."""
+    force = os.getenv("DESK_TOTP_SHOW_QR", "").strip().lower() in {"1", "true", "yes"}
+    if totp_enrolled() and not force:
+        return False
+    return enroll_qr_allowed(request)
+
+
+def rotate_totp(current_code: str) -> bool:
+    if not totp_secret() or not totp_matches(current_code):
+        return False
+    import pyotp
+
+    write_totp_secret(pyotp.random_base32())
+    return True
+
+
 def unlock_status(request: Request) -> dict[str, Any]:
     needed = pin_required()
+    unlocked = (not needed) or token_ok(request.cookies.get(COOKIE))
+    method = auth_method()
     return {
         "ok": True,
         "required": needed,
-        "unlocked": (not needed) or token_ok(request.cookies.get(COOKIE)),
+        "unlocked": unlocked,
+        "method": method,
+        "show_qr": method == "totp" and (unlocked or lock_screen_qr_allowed(request)),
+        "issuer": TOTP_ISSUER,
+        "account": TOTP_ACCOUNT,
     }
 
 
 def locked_response() -> tuple[Any, int]:
-    return jsonify({"ok": False, "locked": True, "message": "PIN required"}), 401
+    if auth_method() == "totp":
+        msg = "authenticator code required"
+    else:
+        msg = "PIN required"
+    return jsonify({"ok": False, "locked": True, "message": msg, "method": auth_method()}), 401
+
+
+def page_open(request: Request) -> bool:
+    """HTML desk and its assets load before unlock; JSON APIs stay locked."""
+    if request.method != "GET":
+        return False
+    path = request.path or "/"
+    return path == "/" or path.startswith("/static/")
 
 
 def gate_request(request: Request) -> tuple[Any, int] | None:
@@ -136,6 +301,10 @@ def gate_request(request: Request) -> tuple[Any, int] | None:
         return None
     if (request.path, request.method) in OPEN_PATHS:
         return None
+    if page_open(request):
+        return None
     if token_ok(request.cookies.get(COOKIE)):
+        return None
+    if request.method == "GET" and request.path == "/api/totp/qr" and lock_screen_qr_allowed(request):
         return None
     return locked_response()

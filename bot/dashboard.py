@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import os
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from bot.auth import (
+    TOTP_ACCOUNT,
+    TOTP_ISSUER,
+    auth_method,
     clear_fails,
     clear_unlock_cookie,
     client_ip,
+    code_matches,
     gate_request,
-    pin_matches,
+    mark_totp_enrolled,
     pin_required,
     rate_limited,
     record_fail,
+    rotate_totp,
     set_unlock_cookie,
+    totp_qr_png,
+    totp_secret,
     unlock_status,
 )
 from bot.engine import BotEngine
@@ -39,6 +46,8 @@ def create_app(engine: BotEngine) -> Flask:
     def add_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
         if not pin_required():
             response.headers["Access-Control-Allow-Origin"] = "*"
             return response
@@ -64,14 +73,25 @@ def create_app(engine: BotEngine) -> Flask:
             return jsonify({"ok": True, "unlocked": True, "required": False})
         ip = client_ip(request)
         if rate_limited(ip):
-            return jsonify({"ok": False, "locked": True, "message": "too many PIN tries"}), 429
+            return jsonify({"ok": False, "locked": True, "message": "too many tries"}), 429
         data = request.get_json(silent=True) or {}
-        pin = str(data.get("pin") or "")
-        if not pin_matches(pin):
+        code = str(data.get("code") or data.get("pin") or "")
+        if not code_matches(code):
             record_fail(ip)
-            return jsonify({"ok": False, "locked": True, "message": "wrong PIN"}), 401
+            kind = "code" if auth_method() == "totp" else "PIN"
+            return jsonify({"ok": False, "locked": True, "message": f"wrong {kind}", "method": auth_method()}), 401
         clear_fails(ip)
-        response = jsonify({"ok": True, "unlocked": True, "required": True})
+        if auth_method() == "totp":
+            mark_totp_enrolled()
+        response = jsonify(
+            {
+                "ok": True,
+                "unlocked": True,
+                "required": True,
+                "method": auth_method(),
+                "show_qr": False,
+            }
+        )
         return set_unlock_cookie(response, request)
 
     @app.post("/api/lock")
@@ -79,9 +99,36 @@ def create_app(engine: BotEngine) -> Flask:
         response = jsonify({"ok": True, "unlocked": False, "required": pin_required()})
         return clear_unlock_cookie(response)
 
+    @app.get("/api/totp/qr")
+    def totp_qr():
+        if auth_method() != "totp" or not totp_secret():
+            return jsonify({"ok": False, "message": "authenticator is not set"}), 404
+        png = totp_qr_png()
+        if not png:
+            return jsonify({"ok": False, "message": "could not build QR"}), 500
+        return Response(png, mimetype="image/png")
+
+    @app.post("/api/totp/rotate")
+    def totp_rotate():
+        if auth_method() != "totp":
+            return jsonify({"ok": False, "message": "authenticator is not set"}), 400
+        data = request.get_json(silent=True) or {}
+        code = str(data.get("code") or data.get("pin") or "")
+        if not rotate_totp(code):
+            return jsonify({"ok": False, "message": "wrong code — scan stays the same"}), 401
+        response = jsonify(
+            {
+                "ok": True,
+                "message": "New QR is ready. Scan it, then the old 6-digit codes stop working.",
+                "issuer": TOTP_ISSUER,
+                "account": TOTP_ACCOUNT,
+            }
+        )
+        return set_unlock_cookie(response, request)
+
     @app.get("/")
     def home():
-        return jsonify({"ui": _ui_origin(), "state": "/api/state"})
+        return render_template("desk.html")
 
     @app.get("/api/state")
     def state():
@@ -110,6 +157,11 @@ def create_app(engine: BotEngine) -> Flask:
     def sell():
         data = request.get_json(silent=True) or {}
         return jsonify(engine.manual_sell(data.get("symbol")))
+
+    @app.post("/api/report/take")
+    def report_take():
+        data = request.get_json(silent=True) or {}
+        return jsonify(engine.take_htf_report(data.get("symbol")))
 
     @app.post("/api/close")
     def close():

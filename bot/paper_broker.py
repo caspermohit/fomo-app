@@ -102,10 +102,15 @@ class PaperBroker:
                 }
             )
         df = pd.DataFrame(rows)
-        if (timeframe or "M5").upper() == "H4":
+        tf_out = (timeframe or "M5").upper()
+        if tf_out == "H4":
             from bot.analyst import m5_to_h4
 
             df = m5_to_h4(df)
+        elif tf_out == "M15":
+            from bot.analyst import m5_to_m15
+
+            df = m5_to_m15(df)
         return df.tail(count).reset_index(drop=True)
 
     def tick(self, symbol: str) -> tuple[float, float]:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,32 +37,64 @@ def explain_trade_retcode(retcode, comment: str = "") -> str:
     return f"retcode={retcode}{extra}"
 
 
-def _prepare_macos_bridge(app_path: str) -> str:
-    app = Path(app_path)
-    if not app.exists():
-        raise RuntimeError(f"MetaTrader 5.app not found at {app}")
-    wine_dir = app / "Contents" / "SharedSupport" / "wine" / "bin"
-    wine = wine_dir / "wine"
-    wine64 = wine_dir / "wine64"
-    if not wine64.exists() and wine.exists():
-        wine64.symlink_to("wine")
-    wine_bin = str(wine64 if wine64.exists() else wine)
+def _linux_wine_prefix() -> Path:
+    return Path(os.environ.get("WINEPREFIX") or Path.home() / ".wine-mt5")
 
+
+def _linux_terminal(prefix: Path) -> Path:
+    return prefix / "drive_c" / "Program Files" / "MetaTrader 5" / "terminal64.exe"
+
+
+def _prepare_wine_bridge(app_path: str) -> str:
     import mt5_mac.backend as backend
     import mt5_mac.bootstrap as bootstrap
+    from bot.wine_ipc import install_send_timeout
 
-    backend.MT5_APP = str(app)
-    backend.WINE_BIN = wine_bin
-    bootstrap.MT5_APP = str(app)
-    bootstrap.WINE_BIN = wine_bin
-    bootstrap.GET_PIP_URL = "https://bootstrap.pypa.io/pip/3.9/get-pip.py"
     agent = Path(__file__).resolve().parent / "wine_mt5_agent.py"
     backend.AGENT_PATH = str(agent)
     backend.WINE_AGENT_PATH = "Z:" + str(agent).replace("/", "\\")
-    from bot.wine_ipc import install_send_timeout
+    bootstrap.GET_PIP_URL = "https://bootstrap.pypa.io/pip/3.9/get-pip.py"
 
+    if sys.platform == "darwin":
+        app = Path(app_path)
+        if not app.exists():
+            raise RuntimeError(f"MetaTrader 5.app not found at {app}")
+        wine_dir = app / "Contents" / "SharedSupport" / "wine" / "bin"
+        wine = wine_dir / "wine"
+        wine64 = wine_dir / "wine64"
+        if not wine64.exists() and wine.exists():
+            wine64.symlink_to("wine")
+        wine_bin = str(wine64 if wine64.exists() else wine)
+        backend.MT5_APP = str(app)
+        backend.WINE_BIN = wine_bin
+        bootstrap.MT5_APP = str(app)
+        bootstrap.WINE_BIN = wine_bin
+        install_send_timeout()
+        return wine_bin
+
+    wine_bin = os.environ.get("WINE_BIN") or shutil.which("wine") or "/usr/bin/wine"
+    if not Path(wine_bin).exists():
+        raise RuntimeError(f"Wine not found at {wine_bin}")
+    prefix = _linux_wine_prefix()
+    terminal = _linux_terminal(prefix)
+    if not terminal.exists():
+        raise RuntimeError(
+            f"MetaTrader 5 terminal not found at {terminal}. "
+            "Install the Windows terminal into this Wine prefix."
+        )
+    if not (os.environ.get("DISPLAY") or "").strip():
+        raise RuntimeError("Wine needs DISPLAY. Start Xvfb and export DISPLAY=:99.")
+    os.environ["WINEPREFIX"] = str(prefix)
+    backend.WINE_BIN = wine_bin
+    backend.DEFAULT_WINEPREFIX = str(prefix)
+    bootstrap.WINE_BIN = wine_bin
+    bootstrap.DEFAULT_WINEPREFIX = str(prefix)
     install_send_timeout()
     return wine_bin
+
+
+def _prepare_macos_bridge(app_path: str) -> str:
+    return _prepare_wine_bridge(app_path)
 
 
 def _load_mt5(app_path: str):
@@ -78,6 +113,9 @@ class MT5Broker:
         self.settings = settings
         self.mt5 = _load_mt5(settings.mt5_path)
         self._connected = False
+        self._history_archive: list = []
+        self._history_archive_at = 0.0
+        self._history_archive_start = 0
 
     def connect(self) -> AccountSnapshot:
         mt5 = self.mt5
@@ -175,22 +213,62 @@ class MT5Broker:
             trade_expert=bool(getattr(info, "trade_expert", True)),
         )
 
+    def _history_deals_window(self, t0: int, t1: int) -> tuple[list, bool]:
+        try:
+            return list(self.mt5.history_deals_get(t0, t1) or []), True
+        except Exception:
+            return [], False
+
+    def _older_history_deals(self, start: int, recent_from: int) -> list:
+        if recent_from <= start:
+            return []
+        now_m = time.monotonic()
+        archive = getattr(self, "_history_archive", [])
+        archive_at = float(getattr(self, "_history_archive_at", 0.0) or 0.0)
+        archive_start = int(getattr(self, "_history_archive_start", 0) or 0)
+        if archive and now_m - archive_at < 45 and archive_start == int(start):
+            return list(archive)
+        deals: list = []
+        t1 = int(recent_from)
+        chunk = 180 * 86400
+        ok = True
+        while t1 > start:
+            t0 = max(start, t1 - chunk)
+            part, ok = self._history_deals_window(t0, t1)
+            deals.extend(part)
+            if not ok:
+                break
+            if t0 <= start:
+                break
+            t1 = t0
+        self._history_archive = deals
+        self._history_archive_at = now_m
+        self._history_archive_start = int(start)
+        return deals
+
     def closed_trades(self, since_ts: int) -> list[ClosedTrade]:
-        now = int(datetime.now(timezone.utc).timestamp())
-        deals = self.mt5.history_deals_get(since_ts, now) or []
+        now = int(datetime.now(timezone.utc).timestamp()) + 12 * 3600
+        start = int(since_ts) if int(since_ts or 0) > 0 else int(datetime(2018, 1, 1, tzinfo=timezone.utc).timestamp())
+        start = min(start, now - 60)
+        recent_from = max(start, now - 14 * 86400)
+        recent, _ok = self._history_deals_window(recent_from, now)
+        deals = list(recent) + self._older_history_deals(start, recent_from)
         out = []
+        seen: set[str] = set()
         for deal in deals:
-            if getattr(deal, "entry", 0) not in (1, 2):
+            if getattr(deal, "entry", 0) not in (1, 2, 3):
                 continue
+            ticket = str(getattr(deal, "ticket", "") or "")
+            if ticket and ticket in seen:
+                continue
+            if ticket:
+                seen.add(ticket)
             symbol = getattr(deal, "symbol", self.settings.symbol)
-            allowed = set(self.settings.pairs)
-            if symbol and symbol not in allowed:
-                continue
             profit = float(getattr(deal, "profit", 0) or 0)
             swap = float(getattr(deal, "swap", 0) or 0)
             commission = float(getattr(deal, "commission", 0) or 0)
             side = "SELL" if getattr(deal, "type", 0) == 1 else "BUY"
-            when = datetime.fromtimestamp(int(deal.time), timezone.utc)
+            when = datetime.fromtimestamp(int(getattr(deal, "time", 0) or 0), timezone.utc)
             magic_raw = getattr(deal, "magic", None)
             try:
                 magic = int(magic_raw) if magic_raw is not None else None
@@ -205,12 +283,13 @@ class MT5Broker:
                     volume=float(getattr(deal, "volume", 0) or 0),
                     price=float(getattr(deal, "price", 0) or 0),
                     profit=round(profit + swap + commission, 2),
-                    ticket=str(getattr(deal, "ticket", "")),
+                    ticket=ticket,
                     magic=magic,
                     comment=str(getattr(deal, "comment", "") or ""),
                 )
             )
-        return list(reversed(out[-2000:]))
+        out.sort(key=lambda t: t.time, reverse=True)
+        return out[:10000]
 
     def disconnect(self) -> None:
         # mt5_mac uses one global backend. Do not shutdown if a newer broker replaced us.
@@ -227,8 +306,6 @@ class MT5Broker:
             pass
 
     def bars(self, symbol: str, count: int = 200, timeframe: str = "M5") -> pd.DataFrame:
-        from bot.analyst import m5_to_h1
-
         mt5 = self.mt5
         try:
             mt5.symbol_select(symbol, True)
@@ -242,6 +319,8 @@ class MT5Broker:
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             return df
         if tf_name == "H1":
+            from bot.analyst import m5_to_h1
+
             m5 = mt5.copy_rates_from_pos(symbol, _MT5_TIMEFRAME["M5"], 0, max(count * 12, 400))
             if m5 is not None and len(m5) > 0:
                 df = pd.DataFrame(list(m5))
@@ -249,6 +328,16 @@ class MT5Broker:
                 hourly = m5_to_h1(df)
                 if len(hourly) >= 25:
                     return hourly.tail(count).reset_index(drop=True)
+        if tf_name == "M15":
+            from bot.analyst import m5_to_m15
+
+            m5 = mt5.copy_rates_from_pos(symbol, _MT5_TIMEFRAME["M5"], 0, max(count * 4, 400))
+            if m5 is not None and len(m5) > 0:
+                df = pd.DataFrame(list(m5))
+                df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+                quarter = m5_to_m15(df)
+                if len(quarter) >= 10:
+                    return quarter.tail(count).reset_index(drop=True)
         raise RuntimeError(f"No MT5 bars for {symbol} {timeframe}")
 
     def symbol_specs(self, symbol: str) -> dict:

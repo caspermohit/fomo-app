@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fomo-app // METATRADER DEMO</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/desk.css?v=vwapema1" />
+  </head>
+  <body>
+    <div id="lockgate" class="lockgate" hidden>
+      <form id="lockform" class="lockcard">
+        <div class="brand">FOMO</div>
+        <p class="reason" id="lock-reason">Open your authenticator app and enter the 6-digit code. The bot keeps running either way.</p>
+        <img id="lock-qr" class="lockqr" alt="Scan to add FOMO desk" hidden />
+        <p class="reason" id="lock-qr-hint" hidden>Google Authenticator / Authy → add account → scan QR. Then type the code below.</p>
+        <label class="field">
+          <span class="k" id="lock-k">Authenticator</span>
+          <input id="pin" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="one-time-code" autofocus />
+        </label>
+        <div id="pinerror" class="flash bad" hidden></div>
+        <button id="unlockbtn" type="submit" class="primary">UNLOCK</button>
+      </form>
+    </div>
+
+    <div id="shell" class="shell" hidden>
+      <aside class="sidebar">
+        <div class="brand">FOMO</div>
+        <div class="hello">
+          <h1>Demo desk</h1>
+          <div id="chip-mode" class="chip">demo</div>
+        </div>
+        <div class="navmark">Trade</div>
+        <div class="k">Symbols</div>
+        <div id="pairs" class="pairs"></div>
+        <div class="grow"></div>
+        <div class="statusline">
+          <div id="chip-running" class="chip live off">STOPPED</div>
+          <div id="mt5bar" class="mt5bar off">
+            <span class="mt5dot"></span>
+            <div class="mt5copy">
+              <b id="mt5-headline">MT5 NOT ATTACHED</b>
+              <div id="mt5-line"></div>
+              <div id="mt5-meta" class="k"></div>
+            </div>
+          </div>
+          <div id="chip-mt5" class="chip live off" hidden>METATRADER OFF</div>
+          <div id="chip-fills" class="chip live off">PAPER FILLS</div>
+          <div id="chip-health" class="chip" hidden></div>
+          <div id="chip-open" class="chip hedge">OPEN 0</div>
+        </div>
+        <div class="head-actions">
+          <button id="btn-retry" type="button">RETRY MT5</button>
+          <button id="btn-lock" type="button" hidden>LOCK</button>
+          <button id="btn-auth" type="button" hidden>AUTHENTICATOR</button>
+          <button id="btn-start" type="button" class="primary">START</button>
+          <button id="btn-stop" type="button" class="stop">STOP</button>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <div class="apptop">
+          <div class="crumb">Home <span>/</span> Trade</div>
+          <div class="ticker">
+            <div class="pxbox">
+              <span id="k-last" class="k">LAST</span>
+              <b id="px-last">—</b>
+            </div>
+            <div class="pxbox">
+              <span class="k">BID/ASK</span>
+              <b id="px-bid" class="bid">—</b>
+              <b id="px-ask" class="ask">—</b>
+            </div>
+            <div class="pxbox">
+              <span class="k">SPREAD</span>
+              <b id="px-spread">—</b>
+            </div>
+            <div class="pxbox">
+              <span class="k">LOT</span>
+              <b id="px-lot">—</b>
+            </div>
+            <div class="pxbox">
+              <span id="k-equity" class="k">EQUITY</span>
+              <b id="px-equity">—</b>
+            </div>
+            <div class="pxbox">
+              <span class="k">DEMO $</span>
+              <b id="px-demo">—</b>
+            </div>
+            <div id="box-hole" class="pxbox">
+              <span class="k">HOLE TO 100k</span>
+              <b id="px-hole">—</b>
+            </div>
+            <div id="box-pnl" class="pxbox">
+              <span class="k">P&amp;L</span>
+              <b id="px-pnl">—</b>
+            </div>
+            <div class="pxbox" title="Session PnL on MetaQuotes demo equity — not live money">
+              <span class="k">SESSION</span>
+              <b id="pnl-today">+$0.00</b>
+            </div>
+            <div class="pxbox">
+              <span class="k">CLOSED/FLOAT</span>
+              <b id="pnl-closed">+$0.00</b>
+              <b id="pnl-float">+$0.00</b>
+            </div>
+            <div class="pxbox">
+              <span class="k">WIN RATE</span>
+              <b id="pnl-wr">0.0% · 0 fills</b>
+            </div>
+          </div>
+          <div class="wallet">
+            <div class="clocks">
+              <div id="clock-utc" class="clock">—</div>
+              <div id="clock-local" class="clock local">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="workbody">
+          <div class="chartscol">
+            <div class="card pad chartcard">
+              <div id="money-k" class="k">Balance</div>
+              <canvas id="money" class="moneygraph"></canvas>
+            </div>
+            <div class="card tvchart">
+              <div class="tvhead">
+                <div>
+                  <div id="chart-k" class="tvpair">—</div>
+                  <div class="tvsub">M5 · live last · buy / sell marks</div>
+                </div>
+                <div class="tvright">
+                  <div id="quote-mid" class="tvlast">—</div>
+                  <div id="quote-chg" class="tvchg">—</div>
+                  <div class="tvquotes">
+                    <span id="quote-ask" class="ask">ASK —</span>
+                    <span id="quote-bid" class="bid">BID —</span>
+                    <span id="quote-spread">spread —</span>
+                  </div>
+                </div>
+              </div>
+              <div class="chartwrap">
+                <canvas id="candles"></canvas>
+              </div>
+              <div class="chartbar">
+                <button type="button" id="tf-m5" class="tf on">M5</button>
+                <button type="button" id="tf-all" class="tf">ALL</button>
+                <button type="button" id="tf-zin" class="tf" title="Zoom in">+</button>
+                <button type="button" id="tf-zout" class="tf" title="Zoom out">−</button>
+                <button type="button" id="tf-live" class="tf" title="Jump to live bar">LIVE</button>
+                <span class="tfsep"></span>
+                <button type="button" id="tf-line" class="tf">LINE</button>
+                <button type="button" id="tf-ema" class="tf on">EMA</button>
+                <button type="button" id="tf-macd" class="tf on">MACD</button>
+                <button type="button" id="tf-rsi" class="tf">RSI</button>
+                <button type="button" id="tf-bb" class="tf">BB</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card pad ticket">
+            <div class="tickhead">
+              <div>
+                <div class="k">Symbol</div>
+                <div id="why-now" class="whynow">—</div>
+              </div>
+            </div>
+            <div class="report" id="report">
+              <div class="reporthead">
+                <div class="k">Report · H1 → M15 → M5</div>
+                <b id="report-bias" class="reportbias">WAIT</b>
+              </div>
+              <ol class="rstages">
+                <li id="report-h1" class="rstage wait"><i></i><span>H1</span><b class="rval">—</b></li>
+                <li id="report-m15" class="rstage wait"><i></i><span>M15</span><b class="rval">—</b></li>
+                <li id="report-m5" class="rstage wait"><i></i><span>M5</span><b class="rval">—</b></li>
+              </ol>
+              <p id="report-why" class="reason">waiting for H1 / M15 / M5…</p>
+              <button id="btn-report" type="button" disabled>SEND WHEN READY</button>
+            </div>
+            <div class="orderpair">
+              <button id="btn-sell" type="button" class="sell" disabled>SELL</button>
+              <button id="btn-buy" type="button" class="buy" disabled>BUY</button>
+            </div>
+            <div class="ticketmeta">
+              <label class="field">
+                Max tickets
+                <input id="max-pos" type="number" min="1" max="4" value="4" />
+              </label>
+              <button id="btn-apply" type="button">APPLY</button>
+            </div>
+            <div class="actions ticketacts">
+              <button id="btn-step" type="button" disabled>STEP NOW</button>
+              <button id="btn-close-all" type="button" class="stop" disabled>CLOSE ALL</button>
+            </div>
+            <div class="actions ticketacts">
+              <button id="btn-paper" type="button">PAPER</button>
+              <button id="btn-mt5fills" type="button" class="stop">DEMO FILLS</button>
+            </div>
+            <div id="gates" class="gates"></div>
+            <div id="last-reason" class="reason">waiting for bot feed…</div>
+            <div id="meta" class="meta"></div>
+          </div>
+        </div>
+
+        <section class="deskrow">
+          <div class="card pad historycard">
+            <div id="closed-k" class="k">Closed trades · all MT5 history</div>
+            <div class="tablewrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time UTC</th>
+                    <th>Pair</th>
+                    <th>Side</th>
+                    <th>Vol</th>
+                    <th>Price</th>
+                    <th>PnL</th>
+                    <th>Ticket</th>
+                  </tr>
+                </thead>
+                <tbody id="closed-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card pad ticketcard">
+            <div class="toolbar">
+              <div class="k">Open tickets</div>
+            </div>
+            <div class="tablewrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Pair</th>
+                    <th>Ticket</th>
+                    <th>Side</th>
+                    <th>Vol</th>
+                    <th>Entry</th>
+                    <th>PnL</th>
+                    <th>Verdict</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody id="open-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card pad whypane">
+            <div id="why-k" class="k">Why this pair is buying or selling</div>
+            <div id="why-head" class="whyhead"></div>
+            <div class="sides">
+              <div id="buy-card" class="sidecard stop">
+                <div class="k">Buy</div>
+                <b id="buy-title">NOT BUYING</b>
+                <ul id="buy-lines"></ul>
+              </div>
+              <div id="sell-card" class="sidecard stop">
+                <div class="k">Sell</div>
+                <b id="sell-title">NOT SELLING</b>
+                <ul id="sell-lines"></ul>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div class="card pad logcard">
+          <ul id="log" class="log"><li>waiting for bot feed…</li></ul>
+        </div>
+      </div>
+
+      <div id="flash" class="flash" hidden>
+        <span id="flash-text"></span>
+        <button id="flash-dismiss" type="button" class="ghost">DISMISS</button>
+      </div>
+
+      <div id="authgate" class="lockgate authpanel" hidden>
+        <div class="lockcard">
+          <div class="brand">Authenticator</div>
+          <p class="reason">Scan this QR to add FOMO desk. To change it later, type the current 6-digit code and make a new QR.</p>
+          <img id="auth-qr" class="lockqr" alt="FOMO authenticator QR" />
+          <label class="field">
+            <span class="k">Current code</span>
+            <input id="auth-code" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" />
+          </label>
+          <div id="auth-msg" class="reason"></div>
+          <button id="btn-totp-rotate" type="button" class="primary">MAKE NEW QR</button>
+          <button id="btn-auth-close" type="button">CLOSE</button>
+        </div>
+      </div>
+
+      <footer>
+        <div>FOMO DEMO · DEMO ONLY</div>
+        <div id="foot-feed" class="feed">ready</div>
+        <div id="foot-account">offline</div>
+      </footer>
+    </div>
+    <script src="/static/desk.js?v=vwapema1" defer></script>
+  </body>
+</html>

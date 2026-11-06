@@ -8,6 +8,7 @@ trading EA that checks that file. Python never yields to an EA lock.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -18,9 +19,12 @@ STALE_SEC = 8.0
 
 
 def mql5_files_dir() -> Path:
-    prefix = os.environ.get("WINEPREFIX") or str(
-        Path.home() / "Library" / "Application Support" / "net.metaquotes.wine.metatrader5"
-    )
+    prefix = os.environ.get("WINEPREFIX")
+    if not prefix:
+        if sys.platform == "darwin":
+            prefix = str(Path.home() / "Library" / "Application Support" / "net.metaquotes.wine.metatrader5")
+        else:
+            prefix = str(Path.home() / ".wine-mt5")
     return Path(prefix) / "drive_c" / "Program Files" / "MetaTrader 5" / "MQL5" / "Files"
 
 

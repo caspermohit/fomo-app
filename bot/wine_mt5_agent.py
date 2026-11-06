@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 try:
@@ -172,6 +172,10 @@ def handle(cmd: dict) -> dict:
             date_from = datetime.utcfromtimestamp(date_from) if date_from else datetime(2000, 1, 1)
         if isinstance(date_to, (int, float)):
             date_to = datetime.utcfromtimestamp(date_to) if date_to else datetime.utcnow()
+        # Terminal filters in broker server time (often GMT+2/+3). UTC datetimes
+        # would drop the latest hours, so pad both ends.
+        date_from = date_from - timedelta(hours=12)
+        date_to = date_to + timedelta(hours=12)
         deals = mt5.history_deals_get(date_from, date_to)
         return {"deals": _serialize(deals)}
 

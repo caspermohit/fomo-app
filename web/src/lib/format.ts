@@ -12,9 +12,9 @@ export function money(n: number | null | undefined): string {
 
 export function tone(n: number | null | undefined): string {
   const v = Number(n || 0);
-  if (v > 0.004) return "#16a34a";
-  if (v < -0.004) return "#e11d48";
-  return "#171717";
+  if (v > 0.004) return "#19e68c";
+  if (v < -0.004) return "#e06a5c";
+  return "#8fa196";
 }
 
 export function push(arr: number[], v: number | null | undefined, max = 48): void {
@@ -24,12 +24,22 @@ export function push(arr: number[], v: number | null | undefined, max = 48): voi
 }
 
 export function pxDigits(symbol: string | null | undefined): number {
-  return String(symbol || "").toUpperCase().endsWith("JPY") ? 3 : 5;
+  const s = String(symbol || "").toUpperCase();
+  if (s.includes("XAU") || s.includes("GOLD")) return 2;
+  if (s.endsWith("JPY")) return 3;
+  return 5;
 }
 
 export function fmtPx(symbol: string | null | undefined, n: number | null | undefined): string {
   if (n == null || Number.isNaN(Number(n))) return "—";
   return Number(n).toFixed(pxDigits(symbol));
+}
+
+export function fmtTime(raw: string | null | undefined): string {
+  const s = String(raw || "").trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (m) return `${m[2]}-${m[3]} ${m[4]}:${m[5]}`;
+  return s || "—";
 }
 
 export function sessionPnl(state: { pnl?: { today?: number; total?: number } } | null): number {

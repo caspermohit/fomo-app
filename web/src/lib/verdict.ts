@@ -49,9 +49,15 @@ export function deskWhy(state: BotState | null, focus?: string): DeskWhy {
   const cooldown = has(blockers, "cooldown");
   const pace = has(blockers, "pace");
   const weekend = has(blockers, "weekend");
+  const mondayOpen = has(blockers, "monday open");
   const correlated = has(blockers, "correlated");
+  const newsHit = book?.news || (state?.news?.active || []).find((e) => String(e.symbol || "").toUpperCase() === symbol);
+  const newsBlock = Boolean(state?.news_blackout !== false && newsHit);
   const sessionOut = session.includes("outside") || Boolean(has(blockers, "outside the configured session"));
     const atrNow = a.atr_pips != null ? Number(a.atr_pips) : null;
+  const atrFloor = Number(book?.min_atr_pips ?? state?.min_atr_pips ?? 4);
+  const atrGate = state?.atr_gate !== false;
+  const atrOk = !atrGate || atrNow == null || Number.isNaN(atrNow) || atrNow + 1e-9 >= atrFloor;
     const spreadOk = spread == null || Number(spread) <= maxSpread;
   const room = open.length < maxPos;
   const deskBusy = allOpen.some((p) => p.symbol && p.symbol !== symbol);
@@ -84,10 +90,22 @@ export function deskWhy(state: BotState | null, focus?: string): DeskWhy {
     if (cooldown) lines.push(cooldown);
     if (pace) lines.push(pace);
     if (weekend) lines.push(weekend);
+    if (mondayOpen) lines.push(mondayOpen);
     if (correlated) lines.push(correlated);
+    if (newsBlock) lines.push(newsHit?.reason || `${symbol} news blackout ${newsHit?.name || ""}`.trim());
+    if (!atrOk && atrNow != null) lines.push(`ATR ${atrNow.toFixed(1)} below floor ${atrFloor} — skip dead tape.`);
     if (sessionOut) lines.push(`Outside London hours (${startH}–${endH} UTC).`);
     if (!spreadOk) lines.push(`Spread ${spread} pip — cap is ${maxSpread}.`);
     if (!running) lines.push("Bot is stopped — press START.");
+    const k = book?.kronos;
+    const kronosOk = !k?.enabled || (side === "BUY" ? k.allow_buy !== false : k.allow_sell !== false);
+    if (k?.enabled) {
+      const pred = String(k.predicted || "n/a").toUpperCase();
+      const bps = k.bps != null ? `${Number(k.bps) >= 0 ? "+" : ""}${Number(k.bps).toFixed(1)} bps` : "no slope";
+      if (pred === "CHOP") lines.push(`Kronos CHOP (no opinion, ${bps}) — MACD ${side} may still fire.`);
+      else if (kronosOk) lines.push(`Kronos ${pred} (${bps}) agrees — allow ${side}.`);
+      else lines.push(`Kronos ${pred} (${bps}) — skip ${side}.`);
+    }
     const mixOk = !openSide || openSide === side;
     const go =
       trendOk &&
@@ -101,7 +119,11 @@ export function deskWhy(state: BotState | null, focus?: string): DeskWhy {
       !cooldown &&
       !pace &&
       !weekend &&
-      !sessionOut;
+      !mondayOpen &&
+      !newsBlock &&
+      atrOk &&
+      !sessionOut &&
+      kronosOk;
     return {
       side,
       go,
@@ -118,13 +140,28 @@ export function deskWhy(state: BotState | null, focus?: string): DeskWhy {
   else if (openSide === "BUY") now = `${symbol}: HOLDING ${open.length} BUY · not adding`;
   else if (openSide === "SELL") now = `${symbol}: HOLDING ${open.length} SELL · not adding`;
 
+  const nextNews = state?.news?.next;
+  const newsValue = newsBlock
+    ? String(newsHit?.name || "print")
+    : nextNews
+      ? `next ${nextNews.name}`
+      : "clear";
   const gates: Gate[] = [
     { ok: ema200 === "above" || ema200 === "below", label: "M5 vs EMA200", value: ema200 },
     { ok: cross === "BUY" || cross === "SELL", label: "MACD 12/26/9 cross", value: cross },
     { ok: zero === "below" || zero === "above", label: "MACD vs zero", value: zero },
+    {
+      ok: !book?.kronos?.enabled || Boolean(book.kronos.allow_buy || book.kronos.allow_sell),
+      label: "Kronos",
+      value: book?.kronos?.enabled
+        ? `${String(book.kronos.predicted || "n/a").toUpperCase()} ${book.kronos.bps != null ? `${Number(book.kronos.bps).toFixed(1)}bps` : "—"}`
+        : "off",
+    },
     { ok: !sessionOut, label: "London hours", value: sessionOut ? "closed" : `${startH}–${endH} UTC` },
     { ok: spreadOk, label: "Spread", value: spread != null ? `${spread} / ${maxSpread} pip` : "—" },
-    { ok: true, label: "ATR (display)", value: atrNow != null ? `${atrNow.toFixed(1)} pip` : "—" },
+    { ok: atrOk, label: atrGate ? "ATR" : "ATR (off)", value: atrNow != null ? `${atrNow.toFixed(1)} / ${atrFloor} pip` : "—" },
+    { ok: !newsBlock, label: "News", value: state?.news_blackout === false ? "off" : newsValue },
+    { ok: !mondayOpen, label: "Monday open", value: mondayOpen ? mondayOpen : "ok" },
     { ok: !cooldown, label: "Stop cooldown", value: cooldown ? cooldown : "clear" },
     { ok: !pace, label: "Fresh cross only", value: pace ? pace : "ready" },
     { ok: true, label: "Same-side only", value: openSide ? `holding ${openSide}` : "flat" },

@@ -13,9 +13,10 @@ def main() -> None:
     engine.start()
     app = create_app(engine)
     host = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    print(f"API: http://{host}:{settings.dashboard_port}/api/state", flush=True)
+    print(f"Desk: http://{host}:{settings.dashboard_port}/", flush=True)
+    print(f"API:  http://{host}:{settings.dashboard_port}/api/state", flush=True)
     print(f"Health: http://{host}:{settings.dashboard_port}/api/health", flush=True)
-    print("UI:  http://127.0.0.1:3000  (cd web && npm run dev)", flush=True)
+    print("Optional Next.js: http://127.0.0.1:3000  (cd web && npm run dev)", flush=True)
     print(f"PIN lock: {'ON' if pin_required() else 'off'}", flush=True)
     if host != "127.0.0.1" and not pin_required():
         print("WARNING: API is bound beyond loopback without DESK_PIN.", flush=True)
